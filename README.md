@@ -9,10 +9,10 @@ It makes **no audio**. The plugin outputs silence. It is a feasibility step for 
 1. Lists every USB device the plugin can see, from sysfs. For each one it shows vendor and product ids, and each interface with its class, subclass and kernel driver.
 2. Finds a Digitone II: `1935:0b34` (Overbridge), `1935:1034` (Audio/MIDI) or `1935:0134` (MIDI).
 3. Opens its usbfs node and checks which kernel driver, if any, holds interface 1.
-4. Lets go of the kernel drivers on interface 4 (ordinary USB audio) and interface 5 (MIDI), sets USB configuration 1, then claims interface 1 (audio in) and interface 2 (audio out).
-5. Switches both to alt setting 3 and gives the kernel drivers on interfaces 4 and 5 back. It asks the device for its Overbridge name (two vendor reads), waits 100 ms, then sends silent blocks out of endpoint `0x03` in bundles of 24 (header `0x07ff`) while reading endpoint `0x83` in the same size bundles for about a second. Finished transfers are collected directly, because `poll()` does not wake on this MPC when one completes. A good incoming block is 1012 bytes, header `0x0700`, with the sample counter rising by 7. The log then shows a peak for main and for tracks 1 to 6. It then switches both interfaces back to alt setting 0 and releases them.
+4. Leaves the kernel drivers on interface 4 (USB audio control) and interface 5 (MIDI) in place. It does not change the USB configuration. It claims interface 1 (audio in) and interface 2 (audio out).
+5. Switches both to alt setting 3. It asks the device for its Overbridge name (two vendor reads), waits 100 ms, then sends silent blocks out of endpoint `0x03` in bundles of 24 (header `0x07ff`) while reading endpoint `0x83` in the same size bundles. HEAR keeps that going. RUN PROBE does it for about a second, then switches both interfaces back to alt setting 0 and releases them. HEAR does that when it stops. Finished transfers are collected directly, because `poll()` does not wake on this MPC when one completes. A good incoming block is 1012 bytes, header `0x0700`, with the sample counter rising by 7. The log then shows a peak for main and for tracks 1 to 6.
 6. Reports each step with the errno name (EBUSY, EACCES, ENOENT and so on).
-7. Checks that the MIDI interface (5) has its driver again. It shows `IF5 MIDI restored` when the same driver is back, or `IF5 MIDI CHANGED!` when it is not. If the drivers were never released, it shows `IF5 MIDI untouched`.
+7. Checks that interface 5 still has the same kernel driver. It shows `IF5 MIDI untouched` when it does, or `IF5 MIDI CHANGED!` when the driver moved. Letting go of that driver and setting configuration 1 used to bring the port back in the device list with its receive counter stuck at zero, so the MPC ignored play and clock from the Digitone.
 8. Shows a short verdict on the plugin screen, and appends a full log to the MPC's drive.
 
 It never resets the device. A plugin scan does not run it.
@@ -42,7 +42,7 @@ Interfaces Overwitch uses on the 2.1 protocol:
 - Interface 4: control
 - Interface 5: MIDI
 
-Overwitch detaches kernel drivers from 4 and 5, claims 1 and 2, then gives 4 and 5 back and keeps a framed stream going in both directions. This probe follows that same claim order. The descriptors on the MPC are read at runtime, so the log shows whether the MPC sees the same layout.
+Overwitch detaches kernel drivers from 4 and 5, claims 1 and 2, then gives 4 and 5 back and keeps a framed stream going in both directions. This probe claims 1 and 2 the same way, but it never detaches 4 or 5 and it never sets the USB configuration. On this MPC those two steps recreate the Digitone sound card. The MIDI port stays in the list and its receive counter stays at zero, so transport never arrives. The descriptors on the MPC are read at runtime, so the log shows whether the MPC sees the same layout.
 
 ## What a playing pattern looks like
 

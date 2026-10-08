@@ -7,14 +7,15 @@
  * Overwitch (https://github.com/dagargo/overwitch), Copyright David García Goñi,
  * also GPL-3. No Overwitch source is copied into this file.
  *
- * Lists USB devices from sysfs, opens the usbfs node, lets go of the kernel drivers on
- * interface 4 (ordinary USB audio) and interface 5 (MIDI), sets configuration 1, then
- * claims interface 1 and interface 2 and switches both to alt setting 3. It gives those
- * kernel drivers back, sends silent 24-block bundles out of endpoint 0x03 while reading
- * endpoint 0x83 for about a second, then puts both interfaces back to alt 0 and releases
- * them. Finished transfers are collected directly: on this MPC, poll() does not wake
- * when one completes. It never resets the device. Results go to the plugin readouts
- * and a log file.
+ * Lists USB devices from sysfs and opens the usbfs node. It leaves interface 4
+ * (USB audio control) and interface 5 (MIDI) on their kernel drivers, and it does
+ * not set configuration 1. It claims interface 1 and interface 2 and switches both
+ * to alt setting 3. Dropping the MIDI driver recreates the Digitone sound card:
+ * the MPC still lists the port, but play and clock never arrive. It sends silent
+ * 24-block bundles out of endpoint 0x03 while reading endpoint 0x83, then puts
+ * both interfaces back to alt 0 and releases them. Finished transfers are collected
+ * directly: on this MPC, poll() does not wake when one completes. It never resets
+ * the device. Results go to the plugin readouts and a log file.
  */
 #include <stdatomic.h>
 #include <dirent.h>
@@ -607,6 +608,10 @@ static int kernel_driver(int fd, unsigned int ifnum, int connect, plog_t *L) {
     return e;
 }
 
+/* Not called. Setting configuration 1, or releasing interface 5, recreates the
+ * Digitone sound card. The MIDI name stays in the MPC list and its receive
+ * counter stays at zero, so play and clock from the Digitone never arrive. */
+__attribute__((unused))
 static int set_config(int fd, plog_t *L) {
     unsigned int cfg = 1;
     int e;
@@ -860,9 +865,7 @@ static void *hear_thread(void *unused) {
         plog(&L, "open %s: FAILED %s", node, errname(errno));
         goto save;
     }
-    if (kernel_driver(fd, IF_CONTROL, 0, &L) == 0) let4 = 1;
-    if (kernel_driver(fd, IF_MIDI, 0, &L) == 0) let5 = 1;
-    set_config(fd, &L);
+    plog(&L, "leaving interface 4 and interface 5 on their kernel drivers");
     if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &ifn) != 0) {
         hear_status(errno == EBUSY ? "BUSY: IF1 HELD" : "CLAIM FAILED", NULL, NULL, NULL, NULL);
         plog(&L, "claim if1: FAILED %s", errname(errno));
@@ -907,8 +910,8 @@ static void *hear_thread(void *unused) {
         if (submit_urb(fd, &out_urb[q], 0x03, buf, out_len) == 0) out_live[q] = 1;
         if (submit_urb(fd, &in_urb[q], 0x83, in_mem + (size_t)q * in_len, in_len) == 0) in_live[q] = 1;
     }
-    hear_status("HEARING", NULL, "waiting", NULL, NULL);
-    plog(&L, "hearing: 24-block bundles, 4 stereo pairs");
+    hear_status("HEARING", NULL, "waiting", "IF5 MIDI untouched", NULL);
+    plog(&L, "hearing: 24-block bundles, MIDI left on its driver");
     clock_gettime(CLOCK_MONOTONIC, &t0);
     last = t0;
     while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
@@ -986,13 +989,18 @@ save:
     }
     if (ifdir_midi[0]) {
         char after[64] = "-";
+        const char *midmsg;
         driver_of(ifdir_midi, after, sizeof after);
-        if (!strcmp(after, "none")) {
+        if (let5 && !strcmp(after, "none")) {
             struct timespec pause = { 0, 50000000 };
             nanosleep(&pause, NULL);
             driver_of(ifdir_midi, after, sizeof after);
         }
-        hear_status(NULL, NULL, NULL, !strcmp(drv_before, after) ? "IF5 MIDI restored" : "IF5 MIDI CHANGED!", NULL);
+        if (let5)
+            midmsg = !strcmp(drv_before, after) ? "IF5 MIDI restored" : "IF5 MIDI CHANGED!";
+        else
+            midmsg = !strcmp(drv_before, after) ? "IF5 MIDI untouched" : "IF5 MIDI CHANGED!";
+        hear_status(NULL, NULL, NULL, midmsg, NULL);
         plog(&L, "-- after: if5 (MIDI) driver %s (was %s)", after, drv_before);
     }
     if (L.buf) {
@@ -1200,12 +1208,7 @@ static void run_probe(probe_t *P) {
     int alt3_err = -1, alt0_err = -1, saw_ep = 0, exchanged = 0;
     int if2_claimed = 0, if2_alt3 = -1, if2_alt0 = -1;
     char audio_verdict[TXT] = "";
-    if (kernel_driver(fd, IF_CONTROL, 0, &L) == 0) let4 = 1;
-    if (kernel_driver(fd, IF_MIDI, 0, &L) == 0) {
-        let5 = 1;
-        touched5 = 1;
-    }
-    set_config(fd, &L);
+    plog(&L, "leaving interface 4 and interface 5 on their kernel drivers");
     if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &ifn) == 0) {
         char ifdir_out[PATH_CAP];
         claimed = 1;
