@@ -21,7 +21,7 @@ This program is free software under the GNU General Public License, version 3. S
 
 ## What is known about the Digitone II
 
-Device ids and the Overbridge 2.1 block layout come from [Overwitch](https://github.com/dagargo/overwitch) by David García Goñi (dagargo), GPL-3. No Overwitch source is copied into this tree. Overwitch's own `overwitch-record` was cross-built for the MPC and run against this Digitone II as the check that the track slots really are empty.
+Device ids and the Overbridge 2.1 block layout come from [Overwitch](https://github.com/dagargo/overwitch) by David García Goñi (dagargo), GPL-3. No Overwitch source is copied into this tree. Overwitch's own `overwitch-record` was cross-built for the MPC and run against this Digitone II, then the probe was run on the same playing pattern.
 
 | Mode | USB id | In Overwitch |
 |---|---|---|
@@ -40,17 +40,20 @@ Interfaces Overwitch uses on the 2.1 protocol:
 
 Overwitch detaches kernel drivers from 4 and 5, claims 1 and 2, then gives 4 and 5 back and keeps a framed stream going in both directions. This probe follows that same claim order. The descriptors on the MPC are read at runtime, so the log shows whether the MPC sees the same layout.
 
-## What Overwitch's recorder got
+## What a playing pattern looks like
 
-On this MPC, with the Digitone II at firmware 1.10C (`1935:0b34`), Overwitch 2.1's `overwitch-record` ran its own session: name handshake, continuous host-to-device blocks, and a full read of all 42 channels. Three separate captures of about five to six seconds each wrote a full-rate stream (about 46,000 frames a second).
+On this MPC, with the Digitone II at firmware 1.10C (`1935:0b34`), Overwitch 2.1's `overwitch-record` keeps a continuous host-to-device stream and reads all 42 channels. With the sequencer stopped, that stream is full rate and the track slots are digital zero. Main sits at a tiny noise floor (about ±0.00004).
 
-The track slots were digital zero in every capture:
+With a pattern playing, the same recorder showed real audio: main near half scale or louder, tracks 1 to 5 each with their own level, and the delay, reverb, and chorus returns active. Track 6 and tracks 7 to 16 stayed at 0, which is those slots having nothing to send.
 
-- Main L/R peaked around ±0.00004. That is a whisper, a few hundred steps of a 24-bit sample, not a playing part.
-- Tracks 1 to 16, delay, reverb, and chorus were exact 0.000000.
-- The inputs peaked around ±0.000009.
+The probe, run on that same playing pattern, agreed. In one second it sent and received 6840 blocks (bundles of 24, full 48 kHz). Header `0x0700`, counter rising by 7, no gaps. The loudest 24-bit peaks were:
 
-Those named tracks cover the whole 140-byte audio frame, so the playing audio is not hiding in a slot the names skip. After each run, MIDI interface 5 was back on `snd-usb-audio`, and audio interfaces 1 and 2 were back at alt setting 0.
+- main L 3954224, main R 3412312 (full scale is about 8388607)
+- track 1 around 0.6 million, track 2 around 3 million, track 3 around 1.4 million, track 4 around 0.8 million, track 5 around 2.6 million
+- track 6 was 0
+- a later slot, the fx returns, peaked near 1 million
+
+After that run, MIDI interface 5 was back on `snd-usb-audio`, and audio interfaces 1 and 2 were back at alt setting 0. The earlier all-zero logs were the Digitone not playing. The blocks already on the wire carry the tracks once a pattern is sounding.
 
 ## Build
 
