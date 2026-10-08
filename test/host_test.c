@@ -182,6 +182,11 @@ int main(void) {
     e->get_param(inst, "p_v", zero, sizeof zero);
     check(!strcmp(zero, "NO DIGITONE II PID"), "releasing the button does not run the probe");
 
+    unsigned char outb[OP_OUT_BYTES];
+    fill_out_block(outb, 14);
+    check(outb[0] == 0x07 && outb[1] == 0xff && outb[2] == 0x00 && outb[3] == 14, "silent out block carries header 07ff and the counter");
+    check(outb[4] == 0 && outb[32] == 0 && outb[OP_OUT_BYTES - 1] == 0, "silent out block is otherwise zero");
+
     unsigned char pkts[4][OP_PKT_BYTES];
     int lens[4] = { OP_PKT_BYTES, OP_PKT_BYTES, OP_PKT_BYTES, OP_PKT_BYTES };
     struct burst_view view;
