@@ -212,6 +212,30 @@ int main(void) {
     view_burst(&pkts[0][0], lens, 4, &view);
     check(view.bad_len == 1, "a short packet is counted");
 
+    {
+        struct listen_stats st;
+        unsigned char pkt[OP_PKT_BYTES];
+        int prev_set = 0;
+        uint16_t prev = 0;
+        memset(&st, 0, sizeof st);
+        st.header = -1;
+        memset(pkt, 0, sizeof pkt);
+        pkt[0] = 0x07;
+        pkt[3] = 7;
+        pkt[32] = 0x00;
+        pkt[33] = 0x10;
+        pkt[34] = 0x00; /* main L */
+        note_packet(&st, pkt, OP_PKT_BYTES, &prev_set, &prev);
+        check(st.peak[0] > 0 && st.peak[2] == 0 && st.nonzero > 0, "a level on main L is counted on main only");
+        pkt[3] = 14;
+        pkt[32] = pkt[33] = pkt[34] = 0;
+        pkt[32 + 8] = 0x00;
+        pkt[33 + 8] = 0x20;
+        pkt[34 + 8] = 0x00; /* track 1 L sits after main L/R */
+        note_packet(&st, pkt, OP_PKT_BYTES, &prev_set, &prev);
+        check(st.peak[2] > 0 && st.counter_gaps == 0, "track 1 level is counted and the counter still steps by 7");
+    }
+
     char buf[64] = "";
     check(e->get_param(inst, "run", buf, sizeof buf) == 0, "trigger key has no readout text");
     check(e->get_param(inst, "state", buf, sizeof buf) == 0, "no state chunk is saved");

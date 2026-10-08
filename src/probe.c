@@ -3,7 +3,8 @@
  *
  * Lists USB devices from sysfs, opens the usbfs node, claims interface 1 only, switches that
  * interface to alt setting 3, claims interface 2 and does the same, sends a few silent
- * blocks out of endpoint 0x03 while reading endpoint 0x83, then puts both interfaces
+ * blocks out of endpoint 0x03 while reading endpoint 0x83 for about a second,
+ * then puts both interfaces
  * back to alt 0 and releases them. Finished transfers are collected directly: on this
  * MPC, poll() does not wake when one completes. It never detaches a kernel driver,
  * never resets the device, and never sets a configuration. Results go to the plugin
@@ -187,6 +188,8 @@ static void log_if_state(plog_t *L, const char *ifdir, const char *tag) {
 #define OP_HDR_MARK 0x0700
 #define OP_BURST 8
 #define OP_Q 4
+#define OP_LISTEN_MS 1000
+#define OP_CHANS 14 /* main L/R plus tracks 1..6, each stereo, 4 bytes */
 /* One silent block towards the device: same 32 byte head, then 7 frames of 32 bytes. */
 #define OP_OUT_BYTES 256
 #define OP_OUT_HDR 0x07ff
@@ -266,70 +269,98 @@ static int submit_urb(int fd, struct usbdevfs_urb *urb, unsigned char ep, void *
     return 0;
 }
 
-static void report_in_packets(plog_t *L, const unsigned char *pkts, const int *lens, int got,
-                              int out_sent, char *verdict, char *claim, char *rel) {
-    struct burst_view v;
-    view_burst(pkts, lens, got, &v);
-    if (got > 0 && lens[0] >= 16) {
-        const unsigned char *p = pkts;
-        plog(L, "first 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
-        char counters[128] = "";
-        size_t used = 0;
-        for (int i = 0; i < got && lens[i] == OP_PKT_BYTES; i++) {
-            uint16_t c = load_be16(pkts + (size_t)i * OP_PKT_BYTES + 2);
-            int n = snprintf(counters + used, sizeof counters - used, "%s%u", i ? "," : "", c);
-            if (n < 0 || (size_t)n >= sizeof counters - used) break;
-            used += (size_t)n;
-        }
-        plog(L, "header 0x%04x, counters %s", v.header, counters);
-    }
-    int nonzero = 0;
-    for (int i = 0; i < got; i++) {
-        if (lens[i] != OP_PKT_BYTES) continue;
-        const unsigned char *p = pkts + (size_t)i * OP_PKT_BYTES;
-        for (int b = 32; b < OP_PKT_BYTES; b++) if (p[b]) nonzero++;
-    }
-    plog(L, "in %d, out %d, wrong length %d, header same %d, counter +7 %d, main peak %d, nonzero audio bytes %d",
-         v.n, out_sent, v.bad_len, v.headers_same, v.counter_step, v.peak, nonzero);
-    if (got == 0) snprintf(verdict, TXT, "%s", out_sent ? "SENT, NO PACKETS" : "NO PACKETS");
-    else if (v.bad_len) snprintf(verdict, TXT, "SHORT PACKETS");
-    else if (got < 4) snprintf(verdict, TXT, "TOO FEW PACKETS");
-    else if (!v.counter_step || !v.headers_same) snprintf(verdict, TXT, "BAD COUNTER");
-    else if (v.header != OP_HDR_MARK) snprintf(verdict, TXT, "HDR NOT 0700");
-    else snprintf(verdict, TXT, "AUDIO PACKETS OK");
-    snprintf(claim, TXT, "out %d in %d", out_sent, got);
-    if (got > 0 && v.peak == 0 && nonzero == 0) snprintf(rel, TXT, "all tracks silent");
-    else if (got > 0 && v.peak == 0) snprintf(rel, TXT, "main silent");
-    else snprintf(rel, TXT, "main peak %d", v.peak);
+/* 24-bit sample stored in 4 bytes. The audio may sit in the top three or the
+ * bottom three; take whichever is louder. */
+static int slot_peak(const unsigned char *s) {
+    int hi = (s[0] << 16) | (s[1] << 8) | s[2];
+    int lo = (s[1] << 16) | (s[2] << 8) | s[3];
+    if (hi & 0x800000) hi -= 0x1000000;
+    if (lo & 0x800000) lo -= 0x1000000;
+    if (hi < 0) hi = -hi;
+    if (lo < 0) lo = -lo;
+    return hi > lo ? hi : lo;
 }
 
-/* Listen on 0x83 while sending silent blocks on 0x03. out_bytes is one full OUT packet.
- * A few transfers stay queued so a block is not missed between reads. */
+static const char *chan_name(int ch) {
+    static const char *names[OP_CHANS] = {
+        "main L", "main R", "t1 L", "t1 R", "t2 L", "t2 R", "t3 L", "t3 R",
+        "t4 L", "t4 R", "t5 L", "t5 R", "t6 L", "t6 R"
+    };
+    return names[ch];
+}
+
+struct listen_stats {
+    int peak[OP_CHANS];
+    int later_peak;
+    int nonzero;
+    int packets, bad_len, bad_hdr, counter_gaps;
+    int header;
+    int have_hot;
+    unsigned char hot[48];
+};
+
+static void note_packet(struct listen_stats *st, const unsigned char *p, int len, int *prev_set, uint16_t *prev) {
+    if (len != OP_PKT_BYTES) {
+        st->bad_len++;
+        return;
+    }
+    uint16_t hdr = load_be16(p);
+    uint16_t ctr = load_be16(p + 2);
+    if (st->header < 0) st->header = hdr;
+    if (hdr != OP_HDR_MARK) st->bad_hdr++;
+    if (*prev_set && (uint16_t)(*prev + 7) != ctr) st->counter_gaps++;
+    *prev = ctr;
+    *prev_set = 1;
+    st->packets++;
+    int packet_nz = 0;
+    for (int f = 0; f < OP_FRAMES; f++) {
+        const unsigned char *fr = p + 32 + (size_t)f * OP_FRAME_BYTES;
+        for (int ch = 0; ch < OP_CHANS; ch++) {
+            int pk = slot_peak(fr + (size_t)ch * 4);
+            if (pk > st->peak[ch]) st->peak[ch] = pk;
+        }
+        for (int b = OP_CHANS * 4; b + 2 < OP_FRAME_BYTES; b += 3) {
+            int v = (fr[b] << 16) | (fr[b + 1] << 8) | fr[b + 2];
+            if (v & 0x800000) v -= 0x1000000;
+            if (v < 0) v = -v;
+            if (v > st->later_peak) st->later_peak = v;
+        }
+        for (int b = 0; b < OP_FRAME_BYTES; b++) if (fr[b]) packet_nz++;
+    }
+    st->nonzero += packet_nz;
+    if (packet_nz && !st->have_hot) {
+        memcpy(st->hot, p + 32, sizeof st->hot);
+        st->have_hot = 1;
+    }
+}
+
+/* Listen on 0x83 for about a second while sending silent blocks on 0x03.
+ * out_bytes is one full OUT packet. A few transfers stay queued so a block
+ * is not missed between reads. */
 static void exchange_burst(int fd, plog_t *L, int out_bytes, char *verdict, char *claim, char *rel) {
-    unsigned char *pkts = calloc(OP_BURST, OP_PKT_BYTES);
+    unsigned char *in_mem = calloc(OP_Q, OP_PKT_BYTES);
     unsigned char *out_mem = calloc(OP_Q, (size_t)out_bytes);
-    int lens[OP_BURST];
-    int filled[OP_BURST];
     struct usbdevfs_urb in_urb[OP_Q], out_urb[OP_Q];
     int in_live[OP_Q], out_live[OP_Q];
-    int got = 0, out_sent = 0, in_next = 0;
-    uint16_t counter = 0;
+    struct listen_stats st;
+    int out_sent = 0, prev_set = 0;
+    uint16_t counter = 0, prev = 0;
     struct timespec t0;
-    memset(lens, 0, sizeof lens);
-    memset(filled, 0, sizeof filled);
+    memset(&st, 0, sizeof st);
+    st.header = -1;
     memset(in_live, 0, sizeof in_live);
     memset(out_live, 0, sizeof out_live);
-    if (!pkts || !out_mem) {
+    if (!in_mem || !out_mem) {
         snprintf(verdict, TXT, "NO PACKETS");
         snprintf(claim, TXT, "out of memory");
         snprintf(rel, TXT, "-");
-        free(pkts);
+        free(in_mem);
         free(out_mem);
         return;
     }
     int blocks = out_bytes / OP_OUT_BYTES;
-    plog(L, "-- sending %d-byte silent blocks on 0x03 (%d per packet) and reading 0x83", OP_OUT_BYTES, blocks);
+    plog(L, "-- sending %d-byte silent blocks on 0x03 (%d per packet) and reading 0x83 for %d ms",
+         OP_OUT_BYTES, blocks, OP_LISTEN_MS);
     plog(L, "collecting transfers directly; poll does not wake on this kernel");
     for (int q = 0; q < OP_Q; q++) {
         unsigned char *buf = out_mem + (size_t)q * out_bytes;
@@ -340,13 +371,11 @@ static void exchange_burst(int fd, plog_t *L, int out_bytes, char *verdict, char
         if (submit_urb(fd, &out_urb[q], 0x03, buf, out_bytes) == 0) out_live[q] = 1;
         else plog(L, "submit out: %s (%d)", errname(errno), errno);
     }
-    for (int q = 0; q < OP_Q && in_next < OP_BURST; q++) {
-        if (submit_urb(fd, &in_urb[q], 0x83, pkts + (size_t)in_next * OP_PKT_BYTES, OP_PKT_BYTES) == 0) {
+    for (int q = 0; q < OP_Q; q++) {
+        if (submit_urb(fd, &in_urb[q], 0x83, in_mem + (size_t)q * OP_PKT_BYTES, OP_PKT_BYTES) == 0)
             in_live[q] = 1;
-            in_next++;
-        } else {
+        else
             plog(L, "submit in: %s (%d)", errname(errno), errno);
-        }
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -355,11 +384,10 @@ static void exchange_burst(int fd, plog_t *L, int out_bytes, char *verdict, char
         struct timespec now, pause;
         int live = 0, ms;
         for (int q = 0; q < OP_Q; q++) live += in_live[q] + out_live[q];
-        while (got < OP_BURST && filled[got]) got++;
-        if (got >= OP_BURST || !live) break;
+        if (!live) break;
         clock_gettime(CLOCK_MONOTONIC, &now);
         ms = (int)((now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000);
-        if (ms >= 200) break;
+        if (ms >= OP_LISTEN_MS) break;
         if (ioctl(fd, USBDEVFS_REAPURBNDELAY, &done) < 0 || !done) {
             if (errno != EAGAIN) {
                 plog(L, "reap: %s (%d)", errname(errno), errno);
@@ -380,45 +408,73 @@ static void exchange_burst(int fd, plog_t *L, int out_bytes, char *verdict, char
                 if (done == &out_urb[q]) qo = q;
             }
             if (qi >= 0) {
-                ptrdiff_t off = buf - pkts;
-                int slot = (off >= 0) ? (int)(off / OP_PKT_BYTES) : -1;
                 in_live[qi] = 0;
-                if (status == 0 && slot >= 0 && slot < OP_BURST && off % OP_PKT_BYTES == 0) {
-                    lens[slot] = alen;
-                    filled[slot] = 1;
-                    plog(L, "in %d: %d bytes", slot, alen);
-                    if (in_next < OP_BURST &&
-                        submit_urb(fd, &in_urb[qi], 0x83, pkts + (size_t)in_next * OP_PKT_BYTES, OP_PKT_BYTES) == 0) {
-                        in_live[qi] = 1;
-                        in_next++;
+                if (status == 0) {
+                    if (st.packets == 0 && alen >= 16) {
+                        plog(L, "first 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                             buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                             buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]);
                     }
+                    note_packet(&st, buf, alen, &prev_set, &prev);
                 } else {
                     plog(L, "in status %d", status);
-                    if (slot >= 0 && slot < OP_BURST && !filled[slot] &&
-                        submit_urb(fd, &in_urb[qi], 0x83, pkts + (size_t)slot * OP_PKT_BYTES, OP_PKT_BYTES) == 0)
-                        in_live[qi] = 1;
                 }
+                if (submit_urb(fd, &in_urb[qi], 0x83, buf, OP_PKT_BYTES) == 0) in_live[qi] = 1;
             } else if (qo >= 0) {
                 out_live[qo] = 0;
                 if (status == 0) out_sent++;
                 else plog(L, "out status %d", status);
-                if (status == 0 && out_sent < 32) {
-                    unsigned char *ob = out_mem + (size_t)qo * out_bytes;
+                if (status == 0) {
                     for (int i = 0; i < blocks; i++) {
-                        fill_out_block(ob + (size_t)i * OP_OUT_BYTES, counter);
+                        fill_out_block(buf + (size_t)i * OP_OUT_BYTES, counter);
                         counter = (uint16_t)(counter + 7);
                     }
-                    if (submit_urb(fd, &out_urb[qo], 0x03, ob, out_bytes) == 0) out_live[qo] = 1;
+                    if (submit_urb(fd, &out_urb[qo], 0x03, buf, out_bytes) == 0) out_live[qo] = 1;
                 }
             }
         }
     }
-    while (got < OP_BURST && filled[got]) got++;
-    cancel_live(fd, in_urb, in_live, OP_Q);
-    cancel_live(fd, out_urb, out_live, OP_Q);
-    plog(L, "exchange finished: out accepted %d, in received %d", out_sent, got);
-    report_in_packets(L, pkts, lens, got, out_sent, verdict, claim, rel);
-    free(pkts);
+    {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int ms = (int)((now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000);
+        int hot = 0, hot_i = 0;
+        cancel_live(fd, in_urb, in_live, OP_Q);
+        cancel_live(fd, out_urb, out_live, OP_Q);
+        for (int ch = 0; ch < OP_CHANS; ch++) {
+            if (st.peak[ch] > hot) {
+                hot = st.peak[ch];
+                hot_i = ch;
+            }
+        }
+        plog(L, "exchange finished: out accepted %d, in received %d, %d ms", out_sent, st.packets, ms);
+        plog(L, "header 0x%04x, wrong length %d, bad header %d, counter gaps %d, nonzero audio bytes %d",
+             st.header < 0 ? 0 : st.header, st.bad_len, st.bad_hdr, st.counter_gaps, st.nonzero);
+        plog(L, "main L %d  R %d", st.peak[0], st.peak[1]);
+        plog(L, "t1 L %d R %d   t2 L %d R %d   t3 L %d R %d",
+             st.peak[2], st.peak[3], st.peak[4], st.peak[5], st.peak[6], st.peak[7]);
+        plog(L, "t4 L %d R %d   t5 L %d R %d   t6 L %d R %d",
+             st.peak[8], st.peak[9], st.peak[10], st.peak[11], st.peak[12], st.peak[13]);
+        plog(L, "tracks 7-16 and fx peak %d", st.later_peak);
+        if (st.have_hot) {
+            const unsigned char *h = st.hot;
+            plog(L, "first loud frame: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                 h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]);
+        }
+        if (st.later_peak > hot) hot = st.later_peak;
+        snprintf(claim, TXT, "out %d in %d", out_sent, st.packets);
+        if (st.packets == 0) snprintf(verdict, TXT, "%s", out_sent ? "SENT, NO PACKETS" : "NO PACKETS");
+        else if (st.bad_len > st.packets) snprintf(verdict, TXT, "SHORT PACKETS");
+        else if (st.packets < 4) snprintf(verdict, TXT, "TOO FEW PACKETS");
+        else if (st.bad_hdr) snprintf(verdict, TXT, "HDR NOT 0700");
+        else if (hot > 0) snprintf(verdict, TXT, "AUDIO PACKETS OK");
+        else if (st.counter_gaps) snprintf(verdict, TXT, "BAD COUNTER");
+        else snprintf(verdict, TXT, "STREAM SILENT");
+        if (hot == 0) snprintf(rel, TXT, "all tracks silent");
+        else if (st.later_peak > st.peak[hot_i]) snprintf(rel, TXT, "hot later %d", st.later_peak);
+        else snprintf(rel, TXT, "hot %s %d", chan_name(hot_i), st.peak[hot_i]);
+    }
+    free(in_mem);
     free(out_mem);
 }
 

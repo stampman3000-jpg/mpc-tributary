@@ -10,7 +10,7 @@ It makes **no audio**. The plugin outputs silence. It is a feasibility step for 
 2. Finds a Digitone II: `1935:0b34` (Overbridge), `1935:1034` (Audio/MIDI) or `1935:0134` (MIDI).
 3. Opens its usbfs node and checks which kernel driver, if any, holds interface 1.
 4. Claims interface 1 (audio in) and interface 2 (audio out). It does not claim interface 4 or 5.
-5. Switches both to alt setting 3. It asks the device for its Overbridge name (two vendor reads), waits 100 ms, then sends silent blocks out of endpoint `0x03` (header `0x07ff`) while reading up to 8 packets from `0x83`. Finished transfers are collected directly, because `poll()` does not wake on this MPC when one completes. A good incoming packet is 1012 bytes, header `0x0700`, with the sample counter rising by 7. It then switches both interfaces back to alt setting 0 and releases them.
+5. Switches both to alt setting 3. It asks the device for its Overbridge name (two vendor reads), waits 100 ms, then sends silent blocks out of endpoint `0x03` (header `0x07ff`) while reading endpoint `0x83` for about a second. Finished transfers are collected directly, because `poll()` does not wake on this MPC when one completes. A good incoming packet is 1012 bytes, header `0x0700`, with the sample counter rising by 7. The log then shows a peak for main and for tracks 1 to 6. It then switches both interfaces back to alt setting 0 and releases them.
 6. Reports each step with the errno name (EBUSY, EACCES, ENOENT and so on).
 7. Checks that the MIDI interface (5) still has the same driver as before. It shows the result as `IF5 MIDI untouched` or `IF5 MIDI CHANGED!`.
 8. Shows a short verdict on the plugin screen, and appends a full log to the MPC's drive.
@@ -97,7 +97,8 @@ Each press appends a block to the log, starting with `=== mpc-overprobe run N`. 
 
 | Verdict | Meaning |
 |---|---|
-| `AUDIO PACKETS OK` | Eight-or-so packets arrived, each 1012 bytes, header `0x0700`, counter rising by 7. That is Digitone audio. The main-output peak is on the screen. Silence still counts: the shape is what matters. |
+| `AUDIO PACKETS OK` | Packets arrived for about a second: 1012 bytes, header `0x0700`, counter rising by 7, and at least one track had a non-zero level. The screen names the hottest track. The log lists main and tracks 1 to 6. |
+| `STREAM SILENT` | The packets had the right shape for about a second, and main plus tracks 1 to 6 were still all zeros. |
 | `NO PACKETS` | Alt 3 came up, but nothing arrived on `0x83` before the wait ran out. |
 | `SHORT PACKETS` | Packets arrived, but not at 1012 bytes. The log has the lengths. |
 | `BAD COUNTER` | The packet size was right, but the sample counter did not rise by 7. |
