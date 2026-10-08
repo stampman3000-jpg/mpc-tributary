@@ -10,7 +10,7 @@ It makes **no audio**. The plugin outputs silence. It is a feasibility step for 
 2. Finds a Digitone II: `1935:0b34` (Overbridge), `1935:1034` (Audio/MIDI) or `1935:0134` (MIDI).
 3. Opens its usbfs node and checks which kernel driver, if any, holds interface 1.
 4. Claims **interface 1 only** (the audio input).
-5. Switches interface 1 and interface 2 to alt setting 3. It sends silent blocks out of endpoint `0x03` (header `0x07ff`) while reading up to 8 packets from `0x83`. A good incoming packet is 1012 bytes, header `0x0700`, with the sample counter rising by 7. It then switches both interfaces back to alt setting 0 and releases them.
+5. Switches interface 1 and interface 2 to alt setting 3. It asks the device for its Overbridge name (two vendor reads), waits 100 ms, then sends silent blocks out of endpoint `0x03` (header `0x07ff`) while reading up to 8 packets from `0x83`. A good incoming packet is 1012 bytes, header `0x0700`, with the sample counter rising by 7. It then switches both interfaces back to alt setting 0 and releases them.
 6. Reports each step with the errno name (EBUSY, EACCES, ENOENT and so on).
 7. Checks that the MIDI interface (5) still has the same driver as before. It shows the result as `IF5 MIDI untouched` or `IF5 MIDI CHANGED!`.
 8. Shows a short verdict on the plugin screen, and appends a full log to the MPC's drive.

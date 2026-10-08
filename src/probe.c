@@ -379,6 +379,32 @@ static void clear_halt(int fd, unsigned int ep, plog_t *L) {
     else plog(L, "clear halt 0x%02x: %s (%d) %s", ep, errname(errno), errno, strerror(errno));
 }
 
+/* Device-wide vendor read. Request 1 is the Overbridge name, request 2 follows it.
+ * Returns the byte count, or -1. */
+static int vendor_in(int fd, unsigned char req, plog_t *L) {
+    unsigned char buf[32];
+    struct usbdevfs_ctrltransfer ctl;
+    char text[33];
+    int i, n;
+    memset(&ctl, 0, sizeof ctl);
+    memset(buf, 0, sizeof buf);
+    ctl.bRequestType = 0xc0; /* IN, vendor, device */
+    ctl.bRequest = req;
+    ctl.wLength = sizeof buf;
+    ctl.timeout = 1000;
+    ctl.data = buf;
+    n = (int)ioctl(fd, USBDEVFS_CONTROL, &ctl);
+    if (n < 0) {
+        plog(L, "vendor in req %u: %s (%d) %s", req, errname(errno), errno, strerror(errno));
+        return -1;
+    }
+    for (i = 0; i < n && i < 32; i++) text[i] = (buf[i] >= 32 && buf[i] < 127) ? (char)buf[i] : '.';
+    text[i] = '\0';
+    plog(L, "vendor in req %u: %d bytes [%02x %02x %02x %02x %02x %02x %02x %02x] \"%s\"",
+         req, n, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], text);
+    return n;
+}
+
 /* Alt setting for one interface. Returns 0 on success, else errno. */
 static int set_alt(int fd, unsigned int ifnum, unsigned int alt, plog_t *L) {
     struct usbdevfs_setinterface si;
@@ -642,6 +668,13 @@ static void run_probe(probe_t *P) {
                         exchanged = 1;
                         clear_halt(fd, 0x83, &L);
                         clear_halt(fd, 0x03, &L);
+                        vendor_in(fd, 1, &L);
+                        vendor_in(fd, 2, &L);
+                        {
+                            struct timespec pause = { 0, 100000000 };
+                            nanosleep(&pause, NULL);
+                        }
+                        plog(&L, "waited 100 ms after the name requests");
                         exchange_burst(fd, &L, out_bytes, audio_verdict, claim, rel);
                     } else {
                         snprintf(audio_verdict, sizeof audio_verdict, "OUT EP SMALL");
