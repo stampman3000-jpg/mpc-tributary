@@ -2,19 +2,20 @@
 
 A throwaway probe for one question: can a plugin running on an Akai MPC open and claim the Overbridge audio interface of an Elektron Digitone II (plugged into the MPC's USB host port), while the Digitone's MIDI interface keeps working?
 
-It makes **no audio**. The plugin outputs silence. It is a feasibility step for a later idea, Overwitch as an MPC plugin (receiving the Digitone II's multitrack audio into the MPC).
+It makes **no audio**. The plugin outputs silence. It is a feasibility step for a later plugin that plays the Digitone II's audio on the track the plugin sits on. That track goes to the MPC main like any instrument. Stream on the same track copies it to the Mac. Nothing is recorded, and there is no second track.
 
 ## What it does
 
 1. Lists every USB device the plugin can see, from sysfs. For each one it shows vendor and product ids, and each interface with its class, subclass and kernel driver.
 2. Finds a Digitone II: `1935:0b34` (Overbridge), `1935:1034` (Audio/MIDI) or `1935:0134` (MIDI).
 3. Opens its usbfs node and checks which kernel driver, if any, holds interface 1.
-4. Claims **interface 1 only** (the audio input), then releases it again.
-5. Reports each step with the errno name (EBUSY, EACCES, ENOENT and so on).
-6. Checks that the MIDI interface (5) still has the same driver as before. It shows the result as `IF5 MIDI untouched` or `IF5 MIDI CHANGED!`.
-7. Shows a short verdict on the plugin screen, and appends a full log to the MPC's drive.
+4. Claims **interface 1 only** (the audio input).
+5. Switches interface 1 to alt setting 3, logs whatever endpoints appear (looking for `0x83`), switches it back to alt setting 0, then releases it.
+6. Reports each step with the errno name (EBUSY, EACCES, ENOENT and so on).
+7. Checks that the MIDI interface (5) still has the same driver as before. It shows the result as `IF5 MIDI untouched` or `IF5 MIDI CHANGED!`.
+8. Shows a short verdict on the plugin screen, and appends a full log to the MPC's drive.
 
-It never detaches a kernel driver, never resets the device, never sets a configuration or an alt setting, and never touches interface 5. A plugin scan does not run it: it runs only when you press **RUN PROBE**.
+It never detaches a kernel driver, never resets the device, never sets a configuration, and never touches interfaces 2, 4 or 5. A plugin scan does not run it: it runs only when you press **RUN PROBE**.
 
 ## What is known about the Digitone II
 
@@ -96,10 +97,13 @@ Each press appends a block to the log, starting with `=== mpc-overprobe run N`. 
 
 | Verdict | Meaning |
 |---|---|
-| `CLAIM OK, RELEASED` | The MPC let go of interface 1 and then took it, so the audio interface is claimable. The next step is reading audio. |
+| `ALT3 OK, EP 0x83` | Interface 1 accepted alt setting 3, endpoint `0x83` showed up, and alt 0 was restored. The audio pipe is there. |
+| `ALT3 OK, NO EP 0x83` | Alt 3 was accepted and put back, but endpoint `0x83` did not appear. The log lists what did. |
+| `ALT3 FAILED` | The switch to alt 3 failed. The CLAIM IF1 readout is the errno name. Alt 0 was still attempted. |
+| `ALT0 FAILED` | Alt 3 worked, but the switch back to the idle setting failed. Check the log before using the Digitone again. |
+| `RELEASE FAILED` | The interface was claimed but not released. Check the log. |
 | `BUSY: IF1 HELD` | Something else owns interface 1 (EBUSY). The log's "kernel driver" line shows which one. |
-| `CLAIMED, NOT RELEASED` | Claim worked, but release failed. Check the log. |
-| `CLAIM FAILED` | The claim failed for another reason. The `CLAIM IF1` readout gives the errno name. |
+| `CLAIM FAILED` | The claim failed for another reason. The CLAIM IF1 readout is the errno name. |
 | `NO USBFS NODE` | The MPC gives plugins no usbfs device node. Then no libusb or raw approach works from a plugin. |
 | `OPEN FAILED` | The device node exists but could not be opened (for example EACCES). |
 | `IF1 IS MIDI, SKIPPED` | Interface 1 is USB MIDI on this unit, so the probe refused to claim it. |
@@ -108,7 +112,7 @@ Each press appends a block to the log, starting with `=== mpc-overprobe run N`. 
 
 ## Limits and risks
 
-- This has only been checked on Linux with fake sysfs and usbfs trees. It has not run on a real MPC.
+- The claim-and-release test has run on an MPC One. The alt-setting test is the current step. The host test still only covers the decision logic, on a fake USB tree.
 - The probe runs inside MPC's process, as the plugin's user. Its only writes are the log files.
 - The screen text may refresh only after the next audio block. If it looks stale, press Play once, or read the log.
 - Registering the plugin means editing `MPC.settings`. Keep a backup of that file.

@@ -1,9 +1,10 @@
 /* mpc-overprobe: a no-audio probe. Can a plugin on an Akai MPC claim the Overbridge audio
  * interface of an Elektron Digitone II over USB while its MIDI interface keeps working?
  *
- * Lists USB devices from sysfs, opens the usbfs node, claims interface 1 only, releases it,
- * and logs every step. It never detaches a kernel driver, never resets the device, and never
- * sets a configuration or alt setting. Results go to the plugin readouts and to a log file.
+ * Lists USB devices from sysfs, opens the usbfs node, claims interface 1 only, switches that
+ * interface to alt setting 3 and back to 0, releases it, and logs every step. It never detaches
+ * a kernel driver, never resets the device, and never sets a configuration. Results go to the
+ * plugin readouts and to a log file.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -145,6 +146,45 @@ static void log_endpoints(plog_t *L, const char *ifdir) {
         plog(L, "        endpoint 0x%s  %s %s  max %s", addr, dirn, type, mps);
     }
     closedir(d);
+}
+
+static int has_endpoint(const char *ifdir, const char *addr_want) {
+    DIR *d = opendir(ifdir);
+    if (!d) return 0;
+    struct dirent *e;
+    int found = 0;
+    while (!found && (e = readdir(d))) {
+        if (strncmp(e->d_name, "ep_", 3)) continue;
+        char dir[2 * PATH_CAP], addr[16];
+        snprintf(dir, sizeof dir, "%s/%s", ifdir, e->d_name);
+        read_attr(dir, "bEndpointAddress", addr, sizeof addr);
+        if (!strcmp(addr, addr_want)) found = 1;
+    }
+    closedir(d);
+    return found;
+}
+
+static void log_if_state(plog_t *L, const char *ifdir, const char *tag) {
+    char alt[16], nep[16];
+    read_attr(ifdir, "bAlternateSetting", alt, sizeof alt);
+    read_attr(ifdir, "bNumEndpoints", nep, sizeof nep);
+    plog(L, "-- %s: alt setting %s, endpoint count %s", tag, alt, nep);
+    log_endpoints(L, ifdir);
+}
+
+/* Alt setting for interface 1 only. Returns 0 on success, else errno. */
+static int set_alt(int fd, unsigned int alt, plog_t *L) {
+    struct usbdevfs_setinterface si;
+    memset(&si, 0, sizeof si);
+    si.interface = IF_AUDIO_IN;
+    si.altsetting = alt;
+    if (ioctl(fd, USBDEVFS_SETINTERFACE, &si) == 0) {
+        plog(L, "set if1 alt %u: OK", alt);
+        return 0;
+    }
+    int e = errno;
+    plog(L, "set if1 alt %u: FAILED %s (%d) %s", alt, errname(e), e, strerror(e));
+    return e ? e : EIO;
 }
 
 static void log_interfaces(plog_t *L, const char *devname) {
@@ -362,19 +402,27 @@ static void run_probe(probe_t *P) {
         plog(&L, "usbfs kernel driver on if1: none reported (%s, %d)", strerror(errno), errno);
 
     unsigned int ifn = IF_AUDIO_IN;
+    int alt3_err = -1, alt0_err = -1, saw_ep = 0;
     if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &ifn) == 0) {
         claimed = 1;
-        snprintf(claim, sizeof claim, "if1 claim: OK");
         plog(&L, "claim if1: OK");
+        log_if_state(&L, ifdir_audio, "if1 before alt 3");
+        alt3_err = set_alt(fd, 3, &L);
+        log_if_state(&L, ifdir_audio, "if1 after alt 3");
+        if (alt3_err == 0) saw_ep = has_endpoint(ifdir_audio, "83");
+        plog(&L, "endpoint 0x83 after alt 3: %s", saw_ep ? "present" : "absent");
+        /* Always return to the idle alt setting before releasing, including when alt 3 failed. */
+        alt0_err = set_alt(fd, 0, &L);
+        log_if_state(&L, ifdir_audio, "if1 after alt 0");
         if (ioctl(fd, USBDEVFS_RELEASEINTERFACE, &ifn) == 0) {
             released = 1;
-            snprintf(rel, sizeof rel, "if1 release: OK");
             plog(&L, "release if1: OK");
         } else {
             int e = errno;
-            snprintf(rel, sizeof rel, "if1 release: %s", errname(e));
             plog(&L, "release if1: FAILED %s (%d) %s", errname(e), e, strerror(e));
         }
+        snprintf(claim, sizeof claim, "alt3: %s", alt3_err == 0 ? "OK" : errname(alt3_err));
+        snprintf(rel, sizeof rel, "alt0: %s", alt0_err == 0 ? "OK" : errname(alt0_err));
     } else {
         claim_err = errno;
         snprintf(claim, sizeof claim, "if1 claim: %s", errname(claim_err));
@@ -384,10 +432,13 @@ static void run_probe(probe_t *P) {
     close(fd);
     fd = -1;
 
-    if (claimed && released) snprintf(verdict, sizeof verdict, "CLAIM OK, RELEASED");
-    else if (claimed) snprintf(verdict, sizeof verdict, "CLAIMED, NOT RELEASED");
-    else if (claim_err == EBUSY) snprintf(verdict, sizeof verdict, "BUSY: IF1 HELD");
-    else snprintf(verdict, sizeof verdict, "CLAIM FAILED");
+    if (!claimed && claim_err == EBUSY) snprintf(verdict, sizeof verdict, "BUSY: IF1 HELD");
+    else if (!claimed) snprintf(verdict, sizeof verdict, "CLAIM FAILED");
+    else if (!released) snprintf(verdict, sizeof verdict, "RELEASE FAILED");
+    else if (alt3_err != 0) snprintf(verdict, sizeof verdict, "ALT3 FAILED");
+    else if (alt0_err != 0) snprintf(verdict, sizeof verdict, "ALT0 FAILED");
+    else if (!saw_ep) snprintf(verdict, sizeof verdict, "ALT3 OK, NO EP 0x83");
+    else snprintf(verdict, sizeof verdict, "ALT3 OK, EP 0x83");
 
 done:
     if (!chosen) {
