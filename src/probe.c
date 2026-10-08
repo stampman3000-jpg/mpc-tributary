@@ -4,7 +4,7 @@
  * Lists USB devices from sysfs, opens the usbfs node, lets go of the kernel drivers on
  * interface 4 (ordinary USB audio) and interface 5 (MIDI), sets configuration 1, then
  * claims interface 1 and interface 2 and switches both to alt setting 3. It gives those
- * kernel drivers back, sends a few silent blocks out of endpoint 0x03 while reading
+ * kernel drivers back, sends silent 24-block bundles out of endpoint 0x03 while reading
  * endpoint 0x83 for about a second, then puts both interfaces back to alt 0 and releases
  * them. Finished transfers are collected directly: on this MPC, poll() does not wake
  * when one completes. It never resets the device. Results go to the plugin readouts
@@ -188,7 +188,8 @@ static void log_if_state(plog_t *L, const char *ifdir, const char *tag) {
 #define OP_FRAMES 7
 #define OP_HDR_MARK 0x0700
 #define OP_BURST 8
-#define OP_Q 4
+#define OP_Q 2
+#define OP_BUNDLE 24
 #define OP_LISTEN_MS 1000
 #define OP_CHANS 14 /* main L/R plus tracks 1..6, each stereo, 4 bytes */
 /* One silent block towards the device: same 32 byte head, then 7 frames of 32 bytes. */
@@ -336,16 +337,17 @@ static void note_packet(struct listen_stats *st, const unsigned char *p, int len
     }
 }
 
-/* Listen on 0x83 for about a second while sending silent blocks on 0x03.
- * out_bytes is one full OUT packet. A few transfers stay queued so a block
- * is not missed between reads. */
+/* Listen for about a second. Each transfer carries 24 blocks, which is how a
+ * working Overbridge host paces the stream. out_bytes is one OUT packet. */
 static void exchange_burst(int fd, plog_t *L, int out_bytes, char *verdict, char *claim, char *rel) {
-    unsigned char *in_mem = calloc(OP_Q, OP_PKT_BYTES);
-    unsigned char *out_mem = calloc(OP_Q, (size_t)out_bytes);
+    int out_len = OP_BUNDLE * out_bytes;
+    int in_len = OP_BUNDLE * OP_PKT_BYTES;
+    unsigned char *in_mem = calloc(OP_Q, (size_t)in_len);
+    unsigned char *out_mem = calloc(OP_Q, (size_t)out_len);
     struct usbdevfs_urb in_urb[OP_Q], out_urb[OP_Q];
     int in_live[OP_Q], out_live[OP_Q];
     struct listen_stats st;
-    int out_sent = 0, prev_set = 0;
+    int out_sent = 0, prev_set = 0, logged_in = 0, logged_out = 0;
     uint16_t counter = 0, prev = 0;
     struct timespec t0;
     memset(&st, 0, sizeof st);
@@ -360,21 +362,20 @@ static void exchange_burst(int fd, plog_t *L, int out_bytes, char *verdict, char
         free(out_mem);
         return;
     }
-    int blocks = out_bytes / OP_OUT_BYTES;
-    plog(L, "-- sending %d-byte silent blocks on 0x03 (%d per packet) and reading 0x83 for %d ms",
-         OP_OUT_BYTES, blocks, OP_LISTEN_MS);
+    plog(L, "-- sending %d-block bundles on 0x03 (%d bytes) and reading %d-block bundles on 0x83 (%d bytes) for %d ms",
+         OP_BUNDLE, out_len, OP_BUNDLE, in_len, OP_LISTEN_MS);
     plog(L, "collecting transfers directly; poll does not wake on this kernel");
     for (int q = 0; q < OP_Q; q++) {
-        unsigned char *buf = out_mem + (size_t)q * out_bytes;
-        for (int i = 0; i < blocks; i++) {
-            fill_out_block(buf + (size_t)i * OP_OUT_BYTES, counter);
+        unsigned char *buf = out_mem + (size_t)q * out_len;
+        for (int i = 0; i < OP_BUNDLE; i++) {
+            fill_out_block(buf + (size_t)i * out_bytes, counter);
             counter = (uint16_t)(counter + 7);
         }
-        if (submit_urb(fd, &out_urb[q], 0x03, buf, out_bytes) == 0) out_live[q] = 1;
+        if (submit_urb(fd, &out_urb[q], 0x03, buf, out_len) == 0) out_live[q] = 1;
         else plog(L, "submit out: %s (%d)", errname(errno), errno);
     }
     for (int q = 0; q < OP_Q; q++) {
-        if (submit_urb(fd, &in_urb[q], 0x83, in_mem + (size_t)q * OP_PKT_BYTES, OP_PKT_BYTES) == 0)
+        if (submit_urb(fd, &in_urb[q], 0x83, in_mem + (size_t)q * in_len, in_len) == 0)
             in_live[q] = 1;
         else
             plog(L, "submit in: %s (%d)", errname(errno), errno);
@@ -412,26 +413,40 @@ static void exchange_burst(int fd, plog_t *L, int out_bytes, char *verdict, char
             if (qi >= 0) {
                 in_live[qi] = 0;
                 if (status == 0) {
-                    if (st.packets == 0 && alen >= 16) {
+                    int off = 0;
+                    if (!logged_in) {
+                        logged_in = 1;
+                        plog(L, "first in transfer: %d bytes", alen);
+                    }
+                    if (alen >= 16 && st.packets == 0) {
                         plog(L, "first 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
                              buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
                              buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]);
                     }
-                    note_packet(&st, buf, alen, &prev_set, &prev);
+                    while (off + OP_PKT_BYTES <= alen) {
+                        note_packet(&st, buf + off, OP_PKT_BYTES, &prev_set, &prev);
+                        off += OP_PKT_BYTES;
+                    }
+                    if (off != alen) st.bad_len++;
                 } else {
-                    plog(L, "in status %d", status);
+                    plog(L, "in status %d len %d", status, alen);
                 }
-                if (submit_urb(fd, &in_urb[qi], 0x83, buf, OP_PKT_BYTES) == 0) in_live[qi] = 1;
+                if (submit_urb(fd, &in_urb[qi], 0x83, buf, in_len) == 0) in_live[qi] = 1;
             } else if (qo >= 0) {
                 out_live[qo] = 0;
-                if (status == 0) out_sent++;
-                else plog(L, "out status %d", status);
                 if (status == 0) {
-                    for (int i = 0; i < blocks; i++) {
-                        fill_out_block(buf + (size_t)i * OP_OUT_BYTES, counter);
+                    if (!logged_out) {
+                        logged_out = 1;
+                        plog(L, "first out transfer: %d bytes", alen);
+                    }
+                    out_sent += alen / OP_OUT_BYTES;
+                    for (int i = 0; i < OP_BUNDLE; i++) {
+                        fill_out_block(buf + (size_t)i * out_bytes, counter);
                         counter = (uint16_t)(counter + 7);
                     }
-                    if (submit_urb(fd, &out_urb[qo], 0x03, buf, out_bytes) == 0) out_live[qo] = 1;
+                    if (submit_urb(fd, &out_urb[qo], 0x03, buf, out_len) == 0) out_live[qo] = 1;
+                } else {
+                    plog(L, "out status %d len %d", status, alen);
                 }
             }
         }
