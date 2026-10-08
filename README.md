@@ -17,9 +17,11 @@ It makes **no audio**. The plugin outputs silence. It is a feasibility step for 
 
 It never resets the device. A plugin scan does not run it: it runs only when you press **RUN PROBE**.
 
+This program is free software under the GNU General Public License, version 3. See `LICENSE`.
+
 ## What is known about the Digitone II
 
-From [Overwitch](https://github.com/dagargo/overwitch) (GPL-3) and its udev hwdb. Overwitch was read for ids and interface numbers only. No code is copied.
+Device ids and the Overbridge 2.1 block layout come from [Overwitch](https://github.com/dagargo/overwitch) by David García Goñi (dagargo), GPL-3. No Overwitch source is copied into this tree. Overwitch's own `overwitch-record` was cross-built for the MPC and run against this Digitone II as the check that the track slots really are empty.
 
 | Mode | USB id | In Overwitch |
 |---|---|---|
@@ -36,7 +38,19 @@ Interfaces Overwitch uses on the 2.1 protocol:
 - Interface 4: control
 - Interface 5: MIDI
 
-Overwitch detaches kernel drivers from 4 and 5 and claims 1 and 2. This probe claims only 1. The descriptors on the MPC are read at runtime, so the log shows whether the MPC sees the same layout.
+Overwitch detaches kernel drivers from 4 and 5, claims 1 and 2, then gives 4 and 5 back and keeps a framed stream going in both directions. This probe follows that same claim order. The descriptors on the MPC are read at runtime, so the log shows whether the MPC sees the same layout.
+
+## What Overwitch's recorder got
+
+On this MPC, with the Digitone II at firmware 1.10C (`1935:0b34`), Overwitch 2.1's `overwitch-record` ran its own session: name handshake, continuous host-to-device blocks, and a full read of all 42 channels. Three separate captures of about five to six seconds each wrote a full-rate stream (about 46,000 frames a second).
+
+The track slots were digital zero in every capture:
+
+- Main L/R peaked around ±0.00004. That is a whisper, a few hundred steps of a 24-bit sample, not a playing part.
+- Tracks 1 to 16, delay, reverb, and chorus were exact 0.000000.
+- The inputs peaked around ±0.000009.
+
+Those named tracks cover the whole 140-byte audio frame, so the playing audio is not hiding in a slot the names skip. After each run, MIDI interface 5 was back on `snd-usb-audio`, and audio interfaces 1 and 2 were back at alt setting 0.
 
 ## Build
 

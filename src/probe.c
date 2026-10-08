@@ -1,6 +1,12 @@
 /* mpc-overprobe: a no-audio probe. Can a plugin on an Akai MPC claim the Overbridge audio
  * interface of an Elektron Digitone II over USB while its MIDI interface keeps working?
  *
+ * Copyright (C) 2026 Stampman3000
+ * This program is free software under the GNU General Public License, version 3.
+ * See the LICENSE file. Device ids and the Overbridge 2.1 layout are from
+ * Overwitch (https://github.com/dagargo/overwitch), Copyright David García Goñi,
+ * also GPL-3. No Overwitch source is copied into this file.
+ *
  * Lists USB devices from sysfs, opens the usbfs node, lets go of the kernel drivers on
  * interface 4 (ordinary USB audio) and interface 5 (MIDI), sets configuration 1, then
  * claims interface 1 and interface 2 and switches both to alt setting 3. It gives those
