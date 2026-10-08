@@ -17,7 +17,9 @@ It makes **no audio**. The plugin outputs silence. It is a feasibility step for 
 
 It never resets the device. A plugin scan does not run it.
 
-**HEAR** keeps that same USB session open and plays one stereo pair on the track the plugin sits on. The PAIR knob chooses main, track 1, track 2, or track 3. The Digitone runs at 48 kHz and the MPC track at 44.1 kHz, so each MPC sample takes a small step along the Digitone stream. Press **HEAR** again to stop and release the Digitone. **RUN PROBE** is still the one-second measurement. Leave HEAR off before you press it.
+**HEAR** keeps that same USB session open and plays one stereo pair on the track the plugin sits on. The PAIR knob has all 21: main, tracks 1 to 16, delay, reverb, chorus, and the inputs. The Digitone runs at 48 kHz and the MPC track at 44.1 kHz, so each MPC sample takes a small step along the Digitone stream.
+
+One USB read serves every copy of the plugin. Press **HEAR** on the first track. Put another copy on another track and turn its PAIR knob. It plays that pair from the same read, and it does not start the USB session over. Press **HEAR** again on the copy that started it to stop. Taking the last copy off a track also lets the Digitone go. **RUN PROBE** is still the one-second measurement. Leave HEAR off before you press it.
 
 This program is free software under the GNU General Public License, version 3. See `LICENSE`.
 

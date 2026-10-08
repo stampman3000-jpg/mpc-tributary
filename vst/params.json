@@ -1,7 +1,7 @@
 {
   "params": [
     {"key": "hear", "name": "Hear", "min": 0, "max": 1, "default": 0, "momentary": true},
-    {"key": "pair", "name": "Pair", "min": 0, "max": 3, "default": 0, "options": ["main", "track 1", "track 2", "track 3"]},
+    {"key": "pair", "name": "Pair", "min": 0, "max": 20, "default": 0, "options": ["main", "track 1", "track 2", "track 3", "track 4", "track 5", "track 6", "track 7", "track 8", "track 9", "track 10", "track 11", "track 12", "track 13", "track 14", "track 15", "track 16", "delay", "reverb", "chorus", "input"]},
     {"key": "run", "name": "Run probe", "min": 0, "max": 1, "default": 0, "momentary": true},
     {"key": "p_v", "name": "Verdict", "min": 0, "max": 1, "default": 0, "display": "string"},
     {"key": "p_dev", "name": "Device", "min": 0, "max": 1, "default": 0, "display": "string"},

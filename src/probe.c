@@ -57,7 +57,7 @@
 #define TXT 24
 #define PATH_CAP 1024
 
-#define HEAR_PAIRS 4
+#define HEAR_PAIRS 21
 #define HEAR_CAP 16384
 #define HEAR_MASK (HEAR_CAP - 1)
 /* Digitone is 48 kHz. The MPC asks for 44.1 kHz. This step walks the Digitone
@@ -67,9 +67,10 @@
 typedef struct {
     pthread_mutex_t lock;
     int runs;
-    int pair; /* 0 main, 1..3 tracks */
+    int pair; /* 0 main, 1..16 tracks, then delay, reverb, chorus, input */
     uint32_t rpos, rfrac;
     int primed;
+    int saw; /* this copy has played from the shared read */
     char v[TXT], dev[TXT], claim[TXT], rel[TXT], mid[TXT], logst[TXT];
 } probe_t;
 
@@ -82,6 +83,7 @@ static atomic_int g_alive;
 static pthread_t g_th;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static probe_t *g_owner;
+static int g_instances;
 
 typedef struct { char *buf; size_t len; } plog_t;
 
@@ -299,21 +301,46 @@ static int submit_urb(int fd, struct usbdevfs_urb *urb, unsigned char ep, void *
     return 0;
 }
 
-/* 24-bit sample stored in 4 bytes. The audio may sit in the top three or the
- * bottom three; take whichever is louder. */
 /* Overbridge 2.1 stores a 24-bit sample in a 4-byte slot. The sample is bytes 1..3,
- * big-endian. Adapted from Overwitch engine.c, Copyright (C) 2019 Stefan Rehm and
- * Copyright (C) 2021 David García Goñi. The top 16 bits are what the MPC track can hold. */
+ * big-endian. A 3-byte slot is the same 24-bit sample with no pad byte. Adapted from
+ * Overwitch engine.c, Copyright (C) 2019 Stefan Rehm and Copyright (C) 2021 David
+ * García Goñi. The top 16 bits are what the MPC track can hold. */
 static int16_t ob_i16(const unsigned char *s) {
     int v = (s[1] << 16) | (s[2] << 8) | s[3];
     if (v & 0x800000) v -= 0x1000000;
     return (int16_t)(v >> 8);
 }
 
+static int16_t ob_i16_3(const unsigned char *s) {
+    int v = (s[0] << 16) | (s[1] << 8) | s[2];
+    if (v & 0x800000) v -= 0x1000000;
+    return (int16_t)(v >> 8);
+}
+
 static const char *pair_name(int pair) {
-    static const char *names[HEAR_PAIRS] = { "main", "track 1", "track 2", "track 3" };
+    static const char *names[HEAR_PAIRS] = {
+        "main",
+        "track 1", "track 2", "track 3", "track 4", "track 5", "track 6",
+        "track 7", "track 8", "track 9", "track 10", "track 11", "track 12",
+        "track 13", "track 14", "track 15", "track 16",
+        "delay", "reverb", "chorus", "input"
+    };
     if (pair < 0 || pair >= HEAR_PAIRS) pair = 0;
     return names[pair];
+}
+
+/* Main and tracks 1..6 are 4-byte slots. Tracks 7..16, delay, reverb, chorus
+ * and input are 3-byte slots. Stereo, left then right. */
+static void pair_at(int pair, int *off, int *size) {
+    if (pair < 0) pair = 0;
+    if (pair >= HEAR_PAIRS) pair = HEAR_PAIRS - 1;
+    if (pair < 7) {
+        *off = pair * 8;
+        *size = 4;
+    } else {
+        *off = 56 + (pair - 7) * 6;
+        *size = 3;
+    }
 }
 
 static int slot_peak(const unsigned char *s) {
@@ -746,9 +773,16 @@ static void push_frames(const unsigned char *pkt) {
         uint32_t w = atomic_load_explicit(&g_w, memory_order_relaxed);
         int16_t *dst = g_ring[w & HEAR_MASK];
         for (int p = 0; p < HEAR_PAIRS; p++) {
-            const unsigned char *s = fr + (size_t)p * 8;
-            dst[p * 2] = ob_i16(s);
-            dst[p * 2 + 1] = ob_i16(s + 4);
+            int off, size;
+            pair_at(p, &off, &size);
+            const unsigned char *s = fr + off;
+            if (size == 4) {
+                dst[p * 2] = ob_i16(s);
+                dst[p * 2 + 1] = ob_i16(s + 4);
+            } else {
+                dst[p * 2] = ob_i16_3(s);
+                dst[p * 2 + 1] = ob_i16_3(s + 3);
+            }
         }
         atomic_store_explicit(&g_w, w + 1, memory_order_release);
     }
@@ -992,6 +1026,19 @@ static void hear_toggle(probe_t *P) {
     pthread_mutex_lock(&g_mu);
     if (atomic_load(&g_alive)) {
         int dead = atomic_load(&g_exited);
+        /* A second copy must not restart the USB read or cut the first one off.
+         * HEAR on that copy just locks onto the stream already running.
+         * HEAR on the copy that started it, or on any copy once that one is gone, stops. */
+        if (!dead && g_owner && g_owner != P) {
+            P->primed = 0;
+            P->saw = 1;
+            pthread_mutex_lock(&P->lock);
+            snprintf(P->v, TXT, "HEARING");
+            snprintf(P->rel, TXT, "%s", pair_name(P->pair));
+            pthread_mutex_unlock(&P->lock);
+            pthread_mutex_unlock(&g_mu);
+            return;
+        }
         hear_join_locked();
         if (!dead) {
             pthread_mutex_lock(&P->lock);
@@ -1314,6 +1361,9 @@ static void *create(const char *data_dir) {
     probe_t *P = calloc(1, sizeof *P);
     if (!P) return NULL;
     pthread_mutex_init(&P->lock, NULL);
+    pthread_mutex_lock(&g_mu);
+    g_instances++;
+    pthread_mutex_unlock(&g_mu);
     snprintf(P->v, TXT, "press HEAR");
     snprintf(P->dev, TXT, "-");
     snprintf(P->claim, TXT, "-");
@@ -1325,11 +1375,15 @@ static void *create(const char *data_dir) {
 
 static void destroy(void *inst) {
     probe_t *P = inst;
+    int last;
     if (!P) return;
-    hear_stop();
     pthread_mutex_lock(&g_mu);
+    if (g_instances > 0) g_instances--;
+    last = g_instances <= 0;
     if (g_owner == P) g_owner = NULL;
     pthread_mutex_unlock(&g_mu);
+    /* Other copies may still be playing. Only the last one lets the Digitone go. */
+    if (last) hear_stop();
     pthread_mutex_destroy(&P->lock);
     free(P);
 }
@@ -1379,8 +1433,24 @@ static void render(void *inst, int16_t *out_lr, int frames) {
     probe_t *P = inst;
     if (!out_lr || frames < 1) return;
     memset(out_lr, 0, sizeof(int16_t) * 2 * (size_t)frames);
-    if (!P || !atomic_load_explicit(&g_alive, memory_order_acquire)) return;
-    if (atomic_load_explicit(&g_exited, memory_order_acquire)) return;
+    if (!P) return;
+    if (!atomic_load_explicit(&g_alive, memory_order_acquire) ||
+        atomic_load_explicit(&g_exited, memory_order_acquire)) {
+        if (P->saw) {
+            P->saw = 0;
+            P->primed = 0;
+            pthread_mutex_lock(&P->lock);
+            if (!strcmp(P->v, "HEARING")) snprintf(P->v, TXT, "STOPPED");
+            pthread_mutex_unlock(&P->lock);
+        }
+        return;
+    }
+    if (!P->saw) {
+        P->saw = 1;
+        pthread_mutex_lock(&P->lock);
+        if (!strcmp(P->v, "press HEAR")) snprintf(P->v, TXT, "HEARING");
+        pthread_mutex_unlock(&P->lock);
+    }
     uint32_t w = atomic_load_explicit(&g_w, memory_order_acquire);
     int pair = P->pair;
     if (pair < 0 || pair >= HEAR_PAIRS) pair = 0;

@@ -238,7 +238,9 @@ int main(void) {
 
     {
         unsigned char slot[4] = { 0x00, 0x10, 0x00, 0x00 };
+        unsigned char narrow[3] = { 0x12, 0x34, 0x56 };
         check(ob_i16(slot) == 4096, "a 4-byte Overbridge slot becomes a 16-bit sample");
+        check(ob_i16_3(narrow) == 0x1234, "a 3-byte Overbridge slot becomes a 16-bit sample");
     }
     e->set_param(inst, "pair", "2");
     check(e->get_param(inst, "pair", r[0], 64) > 0 && !strcmp(r[0], "2"), "pair selector stores track 2");
@@ -251,6 +253,41 @@ int main(void) {
         int quiet = 1;
         for (int i = 0; i < 256; i++) if (silence[i]) quiet = 0;
         check(quiet, "render is silence until HEAR is running");
+    }
+    {
+        unsigned char pkt[OP_PKT_BYTES];
+        void *other;
+        int16_t out[256];
+        int main_peak = 0, delay_peak = 0, i;
+        int off = 0, size = 0;
+        pair_at(17, &off, &size);
+        memset(pkt, 0, sizeof pkt);
+        pkt[32 + 1] = 0x10; /* main L */
+        pkt[32 + off] = 0x40; /* delay L */
+        atomic_store(&g_w, 0);
+        for (i = 0; i < 300; i++) push_frames(pkt);
+        atomic_store(&g_exited, 0);
+        atomic_store(&g_alive, 1);
+        other = e->create(NULL);
+        e->set_param(inst, "pair", "0");
+        e->set_param(other, "pair", "17");
+        e->get_param(other, "p_rel", r[0], 64);
+        check(!strcmp(r[0], "delay") && size == 3 && off == 116, "delay is the 3-byte pair after the tracks");
+        e->render(inst, out, 128);
+        for (i = 0; i < 256; i++) {
+            int a = out[i] < 0 ? -out[i] : out[i];
+            if (a > main_peak) main_peak = a;
+        }
+        e->render(other, out, 128);
+        for (i = 0; i < 256; i++) {
+            int a = out[i] < 0 ? -out[i] : out[i];
+            if (a > delay_peak) delay_peak = a;
+        }
+        check(main_peak > 1000 && delay_peak > 1000 && main_peak != delay_peak,
+              "two copies play different pairs from the same blocks");
+        e->destroy(other);
+        check(atomic_load(&g_alive) == 1, "removing one copy leaves the shared read running");
+        atomic_store(&g_alive, 0);
     }
     reset_fixture();
     e->set_param(inst, "hear", "1");
