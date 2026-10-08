@@ -1,0 +1,22 @@
+{
+  "name": "Overprobe",
+  "vendor": "johnny",
+  "uid": "Ovpr",
+  "version": 1000,
+  "so": "overprobe.so",
+  "params": "params.json",
+  "layout": "layout.conf",
+  "build": {
+    "root": "..",
+    "sources": [
+      "src/probe.c"
+    ],
+    "cflags": [
+      "-pthread"
+    ],
+    "libs": [
+      "-pthread",
+      "-lm"
+    ]
+  }
+}
