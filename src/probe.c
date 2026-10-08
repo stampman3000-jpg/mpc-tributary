@@ -11,7 +11,8 @@
  * (USB audio control) and interface 5 (MIDI) on their kernel drivers, and it does
  * not set configuration 1. It claims interface 1 and interface 2 and switches both
  * to alt setting 3. Dropping the MIDI driver recreates the Digitone sound card:
- * the MPC still lists the port, but play and clock never arrive. It sends silent
+ * the MPC still lists the port, but the sequencer link drops, so play and clock
+ * never arrive. Loading the plugin wires that link again. It sends silent
  * 24-block bundles out of endpoint 0x03 while reading endpoint 0x83, then puts
  * both interfaces back to alt 0 and releases them. Finished transfers are collected
  * directly: on this MPC, poll() does not wake when one completes. It never resets
@@ -31,10 +32,14 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/utsname.h>
+#include <sound/asequencer.h>
 #include <time.h>
 #include <unistd.h>
 #include <linux/usbdevice_fs.h>
+
+static int repair_seq_link(void);
 
 #ifndef OP_SYSFS_USB
 #define OP_SYSFS_USB "/sys/bus/usb/devices"
@@ -866,6 +871,8 @@ static void *hear_thread(void *unused) {
         goto save;
     }
     plog(&L, "leaving interface 4 and interface 5 on their kernel drivers");
+    if (repair_seq_link() == 0)
+        hear_status(NULL, NULL, NULL, "IF5 MIDI linked", NULL);
     if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &ifn) != 0) {
         hear_status(errno == EBUSY ? "BUSY: IF1 HELD" : "CLAIM FAILED", NULL, NULL, NULL, NULL);
         plog(&L, "claim if1: FAILED %s", errname(errno));
@@ -910,7 +917,7 @@ static void *hear_thread(void *unused) {
         if (submit_urb(fd, &out_urb[q], 0x03, buf, out_len) == 0) out_live[q] = 1;
         if (submit_urb(fd, &in_urb[q], 0x83, in_mem + (size_t)q * in_len, in_len) == 0) in_live[q] = 1;
     }
-    hear_status("HEARING", NULL, "waiting", "IF5 MIDI untouched", NULL);
+    hear_status("HEARING", NULL, "waiting", NULL, NULL);
     plog(&L, "hearing: 24-block bundles, MIDI left on its driver");
     clock_gettime(CLOCK_MONOTONIC, &t0);
     last = t0;
@@ -1348,6 +1355,130 @@ done:
     free(L.buf);
 }
 
+#ifndef __NR_pidfd_open
+#define __NR_pidfd_open 434
+#endif
+#ifndef __NR_pidfd_getfd
+#define __NR_pidfd_getfd 438
+#endif
+
+/* The MPC keeps a private sequencer port for the Digitone. Releasing the USB
+ * MIDI driver drops the connection and the MPC does not put it back, so the
+ * tempo box stays grey and transport never arrives. Wire it the same way the
+ * MPC's own MIDI port is wired: device into the [Out] port, [In] port back. */
+static int repair_seq_link(void) {
+    FILE *f;
+    char line[256];
+    int client = -1, kclient = -1, kport = -1, mpc = -1, mpc_out = -1, mpc_in = -1;
+    int fd = -1, own = 0, rc = -1;
+    f = fopen("/proc/asound/seq/clients", "r");
+    if (!f) return -1;
+    while (fgets(line, sizeof line, f)) {
+        int n, port;
+        char name[128];
+        if (sscanf(line, "Client %d : \"%127[^\"]\"", &n, name) == 2) {
+            client = n;
+            if (!strcmp(name, "Elektron Digitone II")) kclient = n;
+            if (!strcmp(name, "MPC")) mpc = n;
+            continue;
+        }
+        if (sscanf(line, " Port %d : \"%127[^\"]\"", &port, name) != 2 &&
+            sscanf(line, "  Port %d : \"%127[^\"]\"", &port, name) != 2)
+            continue;
+        if (client == kclient && kport < 0) kport = port;
+        if (client == mpc && !strcmp(name, "Elektron Digitone II MIDI 1")) {
+            if (strstr(line, "[Out]")) mpc_out = port;
+            if (strstr(line, "[In]")) mpc_in = port;
+        }
+    }
+    fclose(f);
+    if (kclient < 0 || kport < 0 || mpc < 0 || mpc_out < 0 || mpc_in < 0) return -1;
+    {
+        DIR *d = opendir("/proc/self/fd");
+        struct dirent *de;
+        if (d) {
+            while ((de = readdir(d))) {
+                char path[64], target[64];
+                int num, id = -1;
+                ssize_t n;
+                if (de->d_name[0] == '.') continue;
+                num = atoi(de->d_name);
+                snprintf(path, sizeof path, "/proc/self/fd/%d", num);
+                n = readlink(path, target, sizeof target - 1);
+                if (n < 0) continue;
+                target[n] = '\0';
+                if (strcmp(target, "/dev/snd/seq") != 0) continue;
+                if (ioctl(num, SNDRV_SEQ_IOCTL_CLIENT_ID, &id) == 0 && id == mpc) {
+                    fd = num;
+                    break;
+                }
+            }
+            closedir(d);
+        }
+    }
+    if (fd < 0) {
+        DIR *proc = opendir("/proc");
+        struct dirent *de;
+        if (!proc) return -1;
+        while ((de = readdir(proc)) && fd < 0) {
+            DIR *fds;
+            struct dirent *fe;
+            char fdpath[64];
+            int pid;
+            if (sscanf(de->d_name, "%d", &pid) != 1) continue;
+            snprintf(fdpath, sizeof fdpath, "/proc/%d/fd", pid);
+            fds = opendir(fdpath);
+            if (!fds) continue;
+            while ((fe = readdir(fds))) {
+                char linkpath[320], target[64];
+                int pidfd, targetfd, dupfd, id = -1;
+                ssize_t n;
+                if (fe->d_name[0] == '.') continue;
+                snprintf(linkpath, sizeof linkpath, "/proc/%d/fd/%s", pid, fe->d_name);
+                n = readlink(linkpath, target, sizeof target - 1);
+                if (n < 0) continue;
+                target[n] = '\0';
+                if (strcmp(target, "/dev/snd/seq") != 0) continue;
+                pidfd = (int)syscall(__NR_pidfd_open, pid, 0);
+                if (pidfd < 0) continue;
+                targetfd = atoi(fe->d_name);
+                dupfd = (int)syscall(__NR_pidfd_getfd, pidfd, targetfd, 0);
+                close(pidfd);
+                if (dupfd < 0) continue;
+                if (ioctl(dupfd, SNDRV_SEQ_IOCTL_CLIENT_ID, &id) == 0 && id == mpc) {
+                    fd = dupfd;
+                    own = 1;
+                    break;
+                }
+                close(dupfd);
+            }
+            closedir(fds);
+        }
+        closedir(proc);
+    }
+    if (fd < 0) return -1;
+    {
+        struct snd_seq_port_subscribe sub;
+        int i;
+        int pairs[2][4] = {
+            { kclient, kport, mpc, mpc_out },
+            { mpc, mpc_in, kclient, kport }
+        };
+        rc = 0;
+        for (i = 0; i < 2; i++) {
+            memset(&sub, 0, sizeof sub);
+            sub.sender.client = (unsigned char)pairs[i][0];
+            sub.sender.port = (unsigned char)pairs[i][1];
+            sub.dest.client = (unsigned char)pairs[i][2];
+            sub.dest.port = (unsigned char)pairs[i][3];
+            if (ioctl(fd, SNDRV_SEQ_IOCTL_SUBSCRIBE_PORT, &sub) != 0 && errno != EBUSY)
+                rc = -1;
+        }
+    }
+    if (own) close(fd);
+    return rc;
+}
+
 /* ---- engine interface (same six-slot shape as wrapper/engine.h) ---------- */
 
 typedef struct {
@@ -1373,6 +1504,8 @@ static void *create(const char *data_dir) {
     snprintf(P->rel, TXT, "main");
     snprintf(P->mid, TXT, "-");
     snprintf(P->logst, TXT, "-");
+    if (repair_seq_link() == 0)
+        snprintf(P->mid, TXT, "IF5 MIDI linked");
     return P;
 }
 
