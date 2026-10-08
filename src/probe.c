@@ -4,16 +4,18 @@
  * Lists USB devices from sysfs, opens the usbfs node, claims interface 1 only, switches that
  * interface to alt setting 3, claims interface 2 and does the same, sends a few silent
  * blocks out of endpoint 0x03 while reading endpoint 0x83, then puts both interfaces
- * back to alt 0 and releases them. It never detaches a kernel driver, never resets the
- * device, and never sets a configuration. Results go to the plugin readouts and a log file.
+ * back to alt 0 and releases them. Finished transfers are collected directly: on this
+ * MPC, poll() does not wake when one completes. It never detaches a kernel driver,
+ * never resets the device, and never sets a configuration. Results go to the plugin
+ * readouts and a log file.
  */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -184,6 +186,7 @@ static void log_if_state(plog_t *L, const char *ifdir, const char *tag) {
 #define OP_FRAMES 7
 #define OP_HDR_MARK 0x0700
 #define OP_BURST 8
+#define OP_Q 4
 /* One silent block towards the device: same 32 byte head, then 7 frames of 32 bytes. */
 #define OP_OUT_BYTES 256
 #define OP_OUT_HDR 0x07ff
@@ -237,12 +240,20 @@ static void fill_out_block(unsigned char *dst, uint16_t counter) {
     dst[3] = (unsigned char)(counter & 0xff);
 }
 
-static void cancel_urb(int fd, struct usbdevfs_urb *urb) {
-    ioctl(fd, USBDEVFS_DISCARDURB, urb);
-    struct pollfd pfd = { .fd = fd, .events = POLLIN };
-    poll(&pfd, 1, 200);
-    struct usbdevfs_urb *done = NULL;
-    ioctl(fd, USBDEVFS_REAPURBNDELAY, &done);
+/* Drop queued transfers. poll() does not wake on this MPC, so reap directly. */
+static void cancel_live(int fd, struct usbdevfs_urb *urbs, int *live, int n) {
+    for (int i = 0; i < n; i++) if (live[i]) ioctl(fd, USBDEVFS_DISCARDURB, &urbs[i]);
+    for (int spin = 0; spin < 30; spin++) {
+        struct usbdevfs_urb *done = NULL;
+        int left = 0;
+        if (ioctl(fd, USBDEVFS_REAPURBNDELAY, &done) == 0 && done) {
+            for (int i = 0; i < n; i++) if (done == &urbs[i]) live[i] = 0;
+        }
+        for (int i = 0; i < n; i++) left += live[i];
+        if (!left) return;
+        struct timespec pause = { 0, 1000000 };
+        nanosleep(&pause, NULL);
+    }
 }
 
 static int submit_urb(int fd, struct usbdevfs_urb *urb, unsigned char ep, void *buf, int len) {
@@ -273,8 +284,14 @@ static void report_in_packets(plog_t *L, const unsigned char *pkts, const int *l
         }
         plog(L, "header 0x%04x, counters %s", v.header, counters);
     }
-    plog(L, "in %d, out %d, wrong length %d, header same %d, counter +7 %d, main peak %d",
-         v.n, out_sent, v.bad_len, v.headers_same, v.counter_step, v.peak);
+    int nonzero = 0;
+    for (int i = 0; i < got; i++) {
+        if (lens[i] != OP_PKT_BYTES) continue;
+        const unsigned char *p = pkts + (size_t)i * OP_PKT_BYTES;
+        for (int b = 32; b < OP_PKT_BYTES; b++) if (p[b]) nonzero++;
+    }
+    plog(L, "in %d, out %d, wrong length %d, header same %d, counter +7 %d, main peak %d, nonzero audio bytes %d",
+         v.n, out_sent, v.bad_len, v.headers_same, v.counter_step, v.peak, nonzero);
     if (got == 0) snprintf(verdict, TXT, "%s", out_sent ? "SENT, NO PACKETS" : "NO PACKETS");
     else if (v.bad_len) snprintf(verdict, TXT, "SHORT PACKETS");
     else if (got < 4) snprintf(verdict, TXT, "TOO FEW PACKETS");
@@ -282,88 +299,127 @@ static void report_in_packets(plog_t *L, const unsigned char *pkts, const int *l
     else if (v.header != OP_HDR_MARK) snprintf(verdict, TXT, "HDR NOT 0700");
     else snprintf(verdict, TXT, "AUDIO PACKETS OK");
     snprintf(claim, TXT, "out %d in %d", out_sent, got);
-    snprintf(rel, TXT, "main peak %d", v.peak);
+    if (got > 0 && v.peak == 0 && nonzero == 0) snprintf(rel, TXT, "all tracks silent");
+    else if (got > 0 && v.peak == 0) snprintf(rel, TXT, "main silent");
+    else snprintf(rel, TXT, "main peak %d", v.peak);
 }
 
-/* Listen on 0x83 while sending silent blocks on 0x03. out_bytes is one full OUT packet. */
+/* Listen on 0x83 while sending silent blocks on 0x03. out_bytes is one full OUT packet.
+ * A few transfers stay queued so a block is not missed between reads. */
 static void exchange_burst(int fd, plog_t *L, int out_bytes, char *verdict, char *claim, char *rel) {
     unsigned char *pkts = calloc(OP_BURST, OP_PKT_BYTES);
-    unsigned char *out_buf = calloc(1, (size_t)out_bytes);
+    unsigned char *out_mem = calloc(OP_Q, (size_t)out_bytes);
     int lens[OP_BURST];
-    struct usbdevfs_urb in_urb, out_urb;
-    int got = 0, out_sent = 0, in_flight = 0, out_flight = 0, misses = 0;
+    int filled[OP_BURST];
+    struct usbdevfs_urb in_urb[OP_Q], out_urb[OP_Q];
+    int in_live[OP_Q], out_live[OP_Q];
+    int got = 0, out_sent = 0, in_next = 0;
     uint16_t counter = 0;
-    if (!pkts || !out_buf) {
+    struct timespec t0;
+    memset(lens, 0, sizeof lens);
+    memset(filled, 0, sizeof filled);
+    memset(in_live, 0, sizeof in_live);
+    memset(out_live, 0, sizeof out_live);
+    if (!pkts || !out_mem) {
         snprintf(verdict, TXT, "NO PACKETS");
         snprintf(claim, TXT, "out of memory");
         snprintf(rel, TXT, "-");
         free(pkts);
-        free(out_buf);
+        free(out_mem);
         return;
     }
     int blocks = out_bytes / OP_OUT_BYTES;
     plog(L, "-- sending %d-byte silent blocks on 0x03 (%d per packet) and reading 0x83", OP_OUT_BYTES, blocks);
-    for (int i = 0; i < blocks; i++) {
-        fill_out_block(out_buf + (size_t)i * OP_OUT_BYTES, counter);
-        counter = (uint16_t)(counter + 7);
-    }
-    if (submit_urb(fd, &out_urb, 0x03, out_buf, out_bytes) == 0) out_flight = 1;
-    else plog(L, "submit out: %s (%d)", errname(errno), errno);
-    if (submit_urb(fd, &in_urb, 0x83, pkts, OP_PKT_BYTES) == 0) in_flight = 1;
-    else plog(L, "submit in: %s (%d)", errname(errno), errno);
-
-    for (int spin = 0; spin < 48 && got < OP_BURST && (in_flight || out_flight); spin++) {
-        struct pollfd pfd = { .fd = fd, .events = POLLIN };
-        struct usbdevfs_urb *primed = NULL;
-        int pr = poll(&pfd, 1, got ? 40 : 200);
-        /* poll() should wake when a transfer finishes. If it does not, a finished
-         * transfer can still be waiting; take that one and count it. */
-        if (pr <= 0) {
-            if (ioctl(fd, USBDEVFS_REAPURBNDELAY, &primed) == 0 && primed) {
-                plog(L, "a transfer finished while poll was idle, ep 0x%02x status %d len %d",
-                     primed->endpoint, primed->status, primed->actual_length);
-            } else {
-                plog(L, "no finished transfer waiting: %s", errname(errno));
-                if (++misses >= 2) break;
-                continue;
-            }
+    plog(L, "collecting transfers directly; poll does not wake on this kernel");
+    for (int q = 0; q < OP_Q; q++) {
+        unsigned char *buf = out_mem + (size_t)q * out_bytes;
+        for (int i = 0; i < blocks; i++) {
+            fill_out_block(buf + (size_t)i * OP_OUT_BYTES, counter);
+            counter = (uint16_t)(counter + 7);
         }
-        misses = 0;
-        for (;;) {
-            struct usbdevfs_urb *done = primed;
-            primed = NULL;
-            if (!done && ioctl(fd, USBDEVFS_REAPURBNDELAY, &done) < 0) break;
-            if (done == &in_urb) {
-                in_flight = 0;
-                if (in_urb.status == 0) {
-                    lens[got] = in_urb.actual_length;
-                    plog(L, "in %d: %d bytes", got, in_urb.actual_length);
-                    got++;
+        if (submit_urb(fd, &out_urb[q], 0x03, buf, out_bytes) == 0) out_live[q] = 1;
+        else plog(L, "submit out: %s (%d)", errname(errno), errno);
+    }
+    for (int q = 0; q < OP_Q && in_next < OP_BURST; q++) {
+        if (submit_urb(fd, &in_urb[q], 0x83, pkts + (size_t)in_next * OP_PKT_BYTES, OP_PKT_BYTES) == 0) {
+            in_live[q] = 1;
+            in_next++;
+        } else {
+            plog(L, "submit in: %s (%d)", errname(errno), errno);
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        struct usbdevfs_urb *done = NULL;
+        struct timespec now, pause;
+        int live = 0, ms;
+        for (int q = 0; q < OP_Q; q++) live += in_live[q] + out_live[q];
+        while (got < OP_BURST && filled[got]) got++;
+        if (got >= OP_BURST || !live) break;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        ms = (int)((now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000);
+        if (ms >= 200) break;
+        if (ioctl(fd, USBDEVFS_REAPURBNDELAY, &done) < 0 || !done) {
+            if (errno != EAGAIN) {
+                plog(L, "reap: %s (%d)", errname(errno), errno);
+                break;
+            }
+            pause.tv_sec = 0;
+            pause.tv_nsec = 50000;
+            nanosleep(&pause, NULL);
+            continue;
+        }
+        {
+            int status = done->status;
+            int alen = done->actual_length;
+            unsigned char *buf = done->buffer;
+            int qi = -1, qo = -1;
+            for (int q = 0; q < OP_Q; q++) {
+                if (done == &in_urb[q]) qi = q;
+                if (done == &out_urb[q]) qo = q;
+            }
+            if (qi >= 0) {
+                ptrdiff_t off = buf - pkts;
+                int slot = (off >= 0) ? (int)(off / OP_PKT_BYTES) : -1;
+                in_live[qi] = 0;
+                if (status == 0 && slot >= 0 && slot < OP_BURST && off % OP_PKT_BYTES == 0) {
+                    lens[slot] = alen;
+                    filled[slot] = 1;
+                    plog(L, "in %d: %d bytes", slot, alen);
+                    if (in_next < OP_BURST &&
+                        submit_urb(fd, &in_urb[qi], 0x83, pkts + (size_t)in_next * OP_PKT_BYTES, OP_PKT_BYTES) == 0) {
+                        in_live[qi] = 1;
+                        in_next++;
+                    }
                 } else {
-                    plog(L, "in status %d", in_urb.status);
+                    plog(L, "in status %d", status);
+                    if (slot >= 0 && slot < OP_BURST && !filled[slot] &&
+                        submit_urb(fd, &in_urb[qi], 0x83, pkts + (size_t)slot * OP_PKT_BYTES, OP_PKT_BYTES) == 0)
+                        in_live[qi] = 1;
                 }
-                if (got < OP_BURST && submit_urb(fd, &in_urb, 0x83, pkts + (size_t)got * OP_PKT_BYTES, OP_PKT_BYTES) == 0)
-                    in_flight = 1;
-            } else if (done == &out_urb) {
-                out_flight = 0;
-                if (out_urb.status == 0) out_sent++;
-                else plog(L, "out status %d", out_urb.status);
-                if (out_sent < 32 && out_urb.status == 0) {
+            } else if (qo >= 0) {
+                out_live[qo] = 0;
+                if (status == 0) out_sent++;
+                else plog(L, "out status %d", status);
+                if (status == 0 && out_sent < 32) {
+                    unsigned char *ob = out_mem + (size_t)qo * out_bytes;
                     for (int i = 0; i < blocks; i++) {
-                        fill_out_block(out_buf + (size_t)i * OP_OUT_BYTES, counter);
+                        fill_out_block(ob + (size_t)i * OP_OUT_BYTES, counter);
                         counter = (uint16_t)(counter + 7);
                     }
-                    if (submit_urb(fd, &out_urb, 0x03, out_buf, out_bytes) == 0) out_flight = 1;
+                    if (submit_urb(fd, &out_urb[qo], 0x03, ob, out_bytes) == 0) out_live[qo] = 1;
                 }
             }
         }
     }
-    if (in_flight) cancel_urb(fd, &in_urb);
-    if (out_flight) cancel_urb(fd, &out_urb);
+    while (got < OP_BURST && filled[got]) got++;
+    cancel_live(fd, in_urb, in_live, OP_Q);
+    cancel_live(fd, out_urb, out_live, OP_Q);
     plog(L, "exchange finished: out accepted %d, in received %d", out_sent, got);
     report_in_packets(L, pkts, lens, got, out_sent, verdict, claim, rel);
     free(pkts);
-    free(out_buf);
+    free(out_mem);
 }
 
 static int endpoint_mps(const char *ifdir, const char *addr_want) {
