@@ -2,14 +2,15 @@
  * interface of an Elektron Digitone II over USB while its MIDI interface keeps working?
  *
  * Lists USB devices from sysfs, opens the usbfs node, claims interface 1 only, switches that
- * interface to alt setting 3 and back to 0, releases it, and logs every step. It never detaches
- * a kernel driver, never resets the device, and never sets a configuration. Results go to the
- * plugin readouts and to a log file.
+ * interface to alt setting 3, reads a short burst from endpoint 0x83, switches back to alt 0,
+ * and releases it. It never detaches a kernel driver, never resets the device, and never sets
+ * a configuration. Results go to the plugin readouts and to a log file.
  */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -170,6 +171,144 @@ static void log_if_state(plog_t *L, const char *ifdir, const char *tag) {
     read_attr(ifdir, "bNumEndpoints", nep, sizeof nep);
     plog(L, "-- %s: alt setting %s, endpoint count %s", tag, alt, nep);
     log_endpoints(L, ifdir);
+}
+
+/* One Overbridge block from the device: 2 byte header, 2 byte counter, 28 private
+ * bytes, then 7 frames. Digitone II frames are 140 bytes, so a block is 1012 bytes.
+ * The header on packets coming from the device is 0x0700, and the counter rises by 7. */
+#define OP_PKT_BYTES 1012
+#define OP_FRAME_BYTES 140
+#define OP_FRAMES 7
+#define OP_HDR_MARK 0x0700
+#define OP_BURST 8
+
+struct burst_view {
+    int n, bad_len, header, headers_same, counter_step, peak;
+};
+
+static uint16_t load_be16(const unsigned char *p) {
+    return (uint16_t)((p[0] << 8) | p[1]);
+}
+
+static int32_t load_be32(const unsigned char *p) {
+    return (int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | p[3]);
+}
+
+static void view_burst(const unsigned char *pkts, const int *lens, int n, struct burst_view *v) {
+    memset(v, 0, sizeof *v);
+    v->n = n;
+    v->header = -1;
+    v->headers_same = 1;
+    v->counter_step = n >= 2;
+    uint16_t prev = 0;
+    for (int i = 0; i < n; i++) {
+        const unsigned char *p = pkts + (size_t)i * OP_PKT_BYTES;
+        if (lens[i] != OP_PKT_BYTES) {
+            v->bad_len++;
+            v->counter_step = 0;
+            continue;
+        }
+        uint16_t hdr = load_be16(p);
+        uint16_t ctr = load_be16(p + 2);
+        if (v->header < 0) v->header = hdr;
+        else if (hdr != (uint16_t)v->header) v->headers_same = 0;
+        if (i > 0 && (uint16_t)(prev + 7) != ctr) v->counter_step = 0;
+        prev = ctr;
+        for (int f = 0; f < OP_FRAMES; f++) {
+            int32_t s = load_be32(p + 32 + (size_t)f * OP_FRAME_BYTES);
+            int a = s < 0 ? (s == INT32_MIN ? INT32_MAX : -s) : s;
+            if (a > v->peak) v->peak = a;
+        }
+    }
+}
+
+static void cancel_urb(int fd, struct usbdevfs_urb *urb) {
+    ioctl(fd, USBDEVFS_DISCARDURB, urb);
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    poll(&pfd, 1, 200);
+    struct usbdevfs_urb *done = NULL;
+    ioctl(fd, USBDEVFS_REAPURBNDELAY, &done);
+}
+
+/* Returns 0 when a packet was reaped, else an errno. The urb buffer is filled in place. */
+static int read_packet(int fd, struct usbdevfs_urb *urb, int wait_ms) {
+    if (ioctl(fd, USBDEVFS_SUBMITURB, urb) < 0) return errno ? errno : EIO;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int pr = poll(&pfd, 1, wait_ms);
+    if (pr <= 0) {
+        int e = pr == 0 ? ETIMEDOUT : errno;
+        cancel_urb(fd, urb);
+        return e ? e : EIO;
+    }
+    struct usbdevfs_urb *done = NULL;
+    if (ioctl(fd, USBDEVFS_REAPURBNDELAY, &done) < 0) {
+        int e = errno ? errno : EIO;
+        cancel_urb(fd, urb);
+        return e;
+    }
+    if (urb->status == 0) return 0;
+    return urb->status < 0 ? -urb->status : urb->status;
+}
+
+static void read_burst(int fd, plog_t *L, char *verdict, char *claim, char *rel) {
+    unsigned char *pkts = calloc(OP_BURST, OP_PKT_BYTES);
+    int lens[OP_BURST];
+    int got = 0, wait_ms = 150, misses = 0;
+    if (!pkts) {
+        snprintf(verdict, TXT, "NO PACKETS");
+        snprintf(claim, TXT, "out of memory");
+        snprintf(rel, TXT, "-");
+        return;
+    }
+    plog(L, "-- reading up to %d packets from endpoint 0x83", OP_BURST);
+    for (int i = 0; i < OP_BURST; i++) {
+        struct usbdevfs_urb urb;
+        memset(&urb, 0, sizeof urb);
+        urb.type = USBDEVFS_URB_TYPE_INTERRUPT;
+        urb.endpoint = 0x83;
+        urb.buffer = pkts + (size_t)got * OP_PKT_BYTES;
+        urb.buffer_length = OP_PKT_BYTES;
+        int err = read_packet(fd, &urb, wait_ms);
+        if (err) {
+            plog(L, "packet %d: %s (%d) %s", i, errname(err), err, strerror(err));
+            if (err == ETIMEDOUT && ++misses >= 2) break;
+            if (err != ETIMEDOUT) break;
+            continue;
+        }
+        misses = 0;
+        wait_ms = 40;
+        lens[got] = urb.actual_length;
+        plog(L, "packet %d: %d bytes, status %d", got, urb.actual_length, urb.status);
+        got++;
+    }
+    struct burst_view v;
+    view_burst(pkts, lens, got, &v);
+    if (got > 0 && lens[0] >= 16) {
+        const unsigned char *p = pkts;
+        plog(L, "first 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+        char counters[128] = "";
+        size_t used = 0;
+        for (int i = 0; i < got && lens[i] == OP_PKT_BYTES; i++) {
+            uint16_t c = load_be16(pkts + (size_t)i * OP_PKT_BYTES + 2);
+            int n = snprintf(counters + used, sizeof counters - used, "%s%u", i ? "," : "", c);
+            if (n < 0 || (size_t)n >= sizeof counters - used) break;
+            used += (size_t)n;
+        }
+        plog(L, "header 0x%04x, counters %s", v.header, counters);
+    }
+    plog(L, "packets %d, wrong length %d, header same %d, counter +7 %d, main peak %d",
+         v.n, v.bad_len, v.headers_same, v.counter_step, v.peak);
+    if (got == 0) snprintf(verdict, TXT, "NO PACKETS");
+    else if (v.bad_len) snprintf(verdict, TXT, "SHORT PACKETS");
+    else if (got < 4) snprintf(verdict, TXT, "TOO FEW PACKETS");
+    else if (!v.counter_step || !v.headers_same) snprintf(verdict, TXT, "BAD COUNTER");
+    else if (v.header != OP_HDR_MARK) snprintf(verdict, TXT, "HDR NOT 0700");
+    else snprintf(verdict, TXT, "AUDIO PACKETS OK");
+    snprintf(claim, TXT, "%d pkts, %d B", got, got ? lens[0] : 0);
+    snprintf(rel, TXT, "main peak %d", v.peak);
+    free(pkts);
 }
 
 /* Alt setting for interface 1 only. Returns 0 on success, else errno. */
@@ -402,7 +541,8 @@ static void run_probe(probe_t *P) {
         plog(&L, "usbfs kernel driver on if1: none reported (%s, %d)", strerror(errno), errno);
 
     unsigned int ifn = IF_AUDIO_IN;
-    int alt3_err = -1, alt0_err = -1, saw_ep = 0;
+    int alt3_err = -1, alt0_err = -1, saw_ep = 0, read_tried = 0;
+    char audio_verdict[TXT] = "";
     if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &ifn) == 0) {
         claimed = 1;
         plog(&L, "claim if1: OK");
@@ -411,6 +551,10 @@ static void run_probe(probe_t *P) {
         log_if_state(&L, ifdir_audio, "if1 after alt 3");
         if (alt3_err == 0) saw_ep = has_endpoint(ifdir_audio, "83");
         plog(&L, "endpoint 0x83 after alt 3: %s", saw_ep ? "present" : "absent");
+        if (alt3_err == 0 && saw_ep) {
+            read_tried = 1;
+            read_burst(fd, &L, audio_verdict, claim, rel);
+        }
         /* Always return to the idle alt setting before releasing, including when alt 3 failed. */
         alt0_err = set_alt(fd, 0, &L);
         log_if_state(&L, ifdir_audio, "if1 after alt 0");
@@ -421,8 +565,10 @@ static void run_probe(probe_t *P) {
             int e = errno;
             plog(&L, "release if1: FAILED %s (%d) %s", errname(e), e, strerror(e));
         }
-        snprintf(claim, sizeof claim, "alt3: %s", alt3_err == 0 ? "OK" : errname(alt3_err));
-        snprintf(rel, sizeof rel, "alt0: %s", alt0_err == 0 ? "OK" : errname(alt0_err));
+        if (!read_tried) {
+            snprintf(claim, sizeof claim, "alt3: %s", alt3_err == 0 ? "OK" : errname(alt3_err));
+            snprintf(rel, sizeof rel, "alt0: %s", alt0_err == 0 ? "OK" : errname(alt0_err));
+        }
     } else {
         claim_err = errno;
         snprintf(claim, sizeof claim, "if1 claim: %s", errname(claim_err));
@@ -438,6 +584,7 @@ static void run_probe(probe_t *P) {
     else if (alt3_err != 0) snprintf(verdict, sizeof verdict, "ALT3 FAILED");
     else if (alt0_err != 0) snprintf(verdict, sizeof verdict, "ALT0 FAILED");
     else if (!saw_ep) snprintf(verdict, sizeof verdict, "ALT3 OK, NO EP 0x83");
+    else if (read_tried) snprintf(verdict, sizeof verdict, "%s", audio_verdict);
     else snprintf(verdict, sizeof verdict, "ALT3 OK, EP 0x83");
 
 done:

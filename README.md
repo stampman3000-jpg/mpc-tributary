@@ -10,7 +10,7 @@ It makes **no audio**. The plugin outputs silence. It is a feasibility step for 
 2. Finds a Digitone II: `1935:0b34` (Overbridge), `1935:1034` (Audio/MIDI) or `1935:0134` (MIDI).
 3. Opens its usbfs node and checks which kernel driver, if any, holds interface 1.
 4. Claims **interface 1 only** (the audio input).
-5. Switches interface 1 to alt setting 3, logs whatever endpoints appear (looking for `0x83`), switches it back to alt setting 0, then releases it.
+5. Switches interface 1 to alt setting 3 and reads up to 8 packets from endpoint `0x83`. A good packet is 1012 bytes, header `0x0700`, with the sample counter rising by 7. It then switches back to alt setting 0 and releases the interface.
 6. Reports each step with the errno name (EBUSY, EACCES, ENOENT and so on).
 7. Checks that the MIDI interface (5) still has the same driver as before. It shows the result as `IF5 MIDI untouched` or `IF5 MIDI CHANGED!`.
 8. Shows a short verdict on the plugin screen, and appends a full log to the MPC's drive.
@@ -97,7 +97,12 @@ Each press appends a block to the log, starting with `=== mpc-overprobe run N`. 
 
 | Verdict | Meaning |
 |---|---|
-| `ALT3 OK, EP 0x83` | Interface 1 accepted alt setting 3, endpoint `0x83` showed up, and alt 0 was restored. The audio pipe is there. |
+| `AUDIO PACKETS OK` | Eight-or-so packets arrived, each 1012 bytes, header `0x0700`, counter rising by 7. That is Digitone audio. The main-output peak is on the screen. Silence still counts: the shape is what matters. |
+| `NO PACKETS` | Alt 3 came up, but nothing arrived on `0x83` before the wait ran out. |
+| `SHORT PACKETS` | Packets arrived, but not at 1012 bytes. The log has the lengths. |
+| `BAD COUNTER` | The packet size was right, but the sample counter did not rise by 7. |
+| `HDR NOT 0700` | Size and counter were right, but the header was not `0x0700`. The log shows the header. |
+| `ALT3 OK, EP 0x83` | Interface 1 accepted alt setting 3 and endpoint `0x83` showed up, but the packet read did not run. |
 | `ALT3 OK, NO EP 0x83` | Alt 3 was accepted and put back, but endpoint `0x83` did not appear. The log lists what did. |
 | `ALT3 FAILED` | The switch to alt 3 failed. The CLAIM IF1 readout is the errno name. Alt 0 was still attempted. |
 | `ALT0 FAILED` | Alt 3 worked, but the switch back to the idle setting failed. Check the log before using the Digitone again. |

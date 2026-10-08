@@ -182,6 +182,31 @@ int main(void) {
     e->get_param(inst, "p_v", zero, sizeof zero);
     check(!strcmp(zero, "NO DIGITONE II PID"), "releasing the button does not run the probe");
 
+    unsigned char pkts[4][OP_PKT_BYTES];
+    int lens[4] = { OP_PKT_BYTES, OP_PKT_BYTES, OP_PKT_BYTES, OP_PKT_BYTES };
+    struct burst_view view;
+    memset(pkts, 0, sizeof pkts);
+    for (int i = 0; i < 4; i++) {
+        pkts[i][0] = 0x07;
+        pkts[i][2] = (unsigned char)((1000 + i * 7) >> 8);
+        pkts[i][3] = (unsigned char)(1000 + i * 7);
+        pkts[i][32] = 0;
+        pkts[i][33] = 0;
+        pkts[i][34] = 0x03;
+        pkts[i][35] = 0xe8; /* main sample 1000 */
+    }
+    view_burst(&pkts[0][0], lens, 4, &view);
+    check(view.header == OP_HDR_MARK && view.counter_step && view.headers_same && view.bad_len == 0 && view.peak == 1000,
+          "four 1012-byte packets with header 0700 and counter +7");
+
+    pkts[2][3] = 0; /* counter no longer steps by 7 */
+    view_burst(&pkts[0][0], lens, 4, &view);
+    check(!view.counter_step, "a counter that does not rise by 7 is rejected");
+
+    lens[1] = 100;
+    view_burst(&pkts[0][0], lens, 4, &view);
+    check(view.bad_len == 1, "a short packet is counted");
+
     char buf[64] = "";
     check(e->get_param(inst, "run", buf, sizeof buf) == 0, "trigger key has no readout text");
     check(e->get_param(inst, "state", buf, sizeof buf) == 0, "no state chunk is saved");
