@@ -1,14 +1,14 @@
 /* mpc-overprobe: a no-audio probe. Can a plugin on an Akai MPC claim the Overbridge audio
  * interface of an Elektron Digitone II over USB while its MIDI interface keeps working?
  *
- * Lists USB devices from sysfs, opens the usbfs node, claims interface 1 only, switches that
- * interface to alt setting 3, claims interface 2 and does the same, sends a few silent
- * blocks out of endpoint 0x03 while reading endpoint 0x83 for about a second,
- * then puts both interfaces
- * back to alt 0 and releases them. Finished transfers are collected directly: on this
- * MPC, poll() does not wake when one completes. It never detaches a kernel driver,
- * never resets the device, and never sets a configuration. Results go to the plugin
- * readouts and a log file.
+ * Lists USB devices from sysfs, opens the usbfs node, lets go of the kernel drivers on
+ * interface 4 (ordinary USB audio) and interface 5 (MIDI), sets configuration 1, then
+ * claims interface 1 and interface 2 and switches both to alt setting 3. It gives those
+ * kernel drivers back, sends a few silent blocks out of endpoint 0x03 while reading
+ * endpoint 0x83 for about a second, then puts both interfaces back to alt 0 and releases
+ * them. Finished transfers are collected directly: on this MPC, poll() does not wake
+ * when one completes. It never resets the device. Results go to the plugin readouts
+ * and a log file.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -44,6 +44,7 @@
 #define ELEKTRON_VID 0x1935
 #define IF_AUDIO_IN 1
 #define IF_AUDIO_OUT 2
+#define IF_CONTROL 4
 #define IF_MIDI 5
 #define LOG_CAP (96 * 1024)
 #define TXT 24
@@ -503,6 +504,42 @@ static void clear_halt(int fd, unsigned int ep, plog_t *L) {
     else plog(L, "clear halt 0x%02x: %s (%d) %s", ep, errname(errno), errno, strerror(errno));
 }
 
+/* Let go of a kernel driver, or give it back. Returns 0 on success, else errno.
+ * connect == 0 releases the driver. connect == 1 asks the kernel to bind it again. */
+static int kernel_driver(int fd, unsigned int ifnum, int connect, plog_t *L) {
+    struct usbdevfs_ioctl cmd;
+    const char *what = connect ? "reconnect driver" : "release driver";
+    int e;
+    memset(&cmd, 0, sizeof cmd);
+    cmd.ifno = (int)ifnum;
+    cmd.ioctl_code = connect ? USBDEVFS_CONNECT : USBDEVFS_DISCONNECT;
+    cmd.data = NULL;
+    if (ioctl(fd, USBDEVFS_IOCTL, &cmd) == 0) {
+        plog(L, "%s if%u: OK", what, ifnum);
+        return 0;
+    }
+    e = errno ? errno : EIO;
+    plog(L, "%s if%u: %s (%d) %s", what, ifnum, errname(e), e, strerror(e));
+    return e;
+}
+
+static int set_config(int fd, plog_t *L) {
+    unsigned int cfg = 1;
+    int e;
+    if (ioctl(fd, USBDEVFS_SETCONFIGURATION, &cfg) == 0) {
+        plog(L, "set configuration 1: OK");
+        return 0;
+    }
+    e = errno ? errno : EIO;
+    plog(L, "set configuration 1: %s (%d) %s", errname(e), e, strerror(e));
+    return e;
+}
+
+static void give_drivers_back(int fd, int *let4, int *let5, plog_t *L) {
+    if (*let4 && kernel_driver(fd, IF_CONTROL, 1, L) == 0) *let4 = 0;
+    if (*let5 && kernel_driver(fd, IF_MIDI, 1, L) == 0) *let5 = 0;
+}
+
 /* Device-wide vendor read. Request 1 is the Overbridge name, request 2 follows it.
  * Returns the byte count, or -1. */
 static int vendor_in(int fd, unsigned char req, plog_t *L) {
@@ -685,6 +722,7 @@ static void run_probe(probe_t *P) {
     char node[PATH_CAP] = "";
     char drv_audio[64] = "-", drv_midi_before[64] = "-", drv_midi_after[64] = "-";
     int have_midi = 0, claimed = 0, released = 0, fd = -1, claim_err = 0;
+    int let4 = 0, let5 = 0, touched5 = 0;
     int chosen = best.rank > 0;
 
     if (!chosen) {
@@ -762,6 +800,12 @@ static void run_probe(probe_t *P) {
     int alt3_err = -1, alt0_err = -1, saw_ep = 0, exchanged = 0;
     int if2_claimed = 0, if2_alt3 = -1, if2_alt0 = -1;
     char audio_verdict[TXT] = "";
+    if (kernel_driver(fd, IF_CONTROL, 0, &L) == 0) let4 = 1;
+    if (kernel_driver(fd, IF_MIDI, 0, &L) == 0) {
+        let5 = 1;
+        touched5 = 1;
+    }
+    set_config(fd, &L);
     if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &ifn) == 0) {
         char ifdir_out[PATH_CAP];
         claimed = 1;
@@ -792,6 +836,7 @@ static void run_probe(probe_t *P) {
                         exchanged = 1;
                         clear_halt(fd, 0x83, &L);
                         clear_halt(fd, 0x03, &L);
+                        give_drivers_back(fd, &let4, &let5, &L);
                         vendor_in(fd, 1, &L);
                         vendor_in(fd, 2, &L);
                         {
@@ -839,6 +884,7 @@ static void run_probe(probe_t *P) {
         snprintf(rel, sizeof rel, "not claimed");
         plog(&L, "claim if1: FAILED %s (%d) %s", errname(claim_err), claim_err, strerror(claim_err));
     }
+    give_drivers_back(fd, &let4, &let5, &L);
     close(fd);
     fd = -1;
 
@@ -858,6 +904,18 @@ done:
         snprintf(mid, sizeof mid, "-");
     } else if (!have_midi) {
         snprintf(mid, sizeof mid, "IF5 MIDI not found");
+    } else if (touched5) {
+        driver_of(ifdir_midi, drv_midi_after, sizeof drv_midi_after);
+        if (!strcmp(drv_midi_after, "none")) {
+            struct timespec pause = { 0, 50000000 };
+            nanosleep(&pause, NULL);
+            driver_of(ifdir_midi, drv_midi_after, sizeof drv_midi_after);
+        }
+        if (!strcmp(drv_midi_before, drv_midi_after))
+            snprintf(mid, sizeof mid, "IF5 MIDI restored");
+        else
+            snprintf(mid, sizeof mid, "IF5 MIDI CHANGED!");
+        plog(&L, "-- after: if5 (MIDI) driver %s (was %s)", drv_midi_after, drv_midi_before);
     } else {
         driver_of(ifdir_midi, drv_midi_after, sizeof drv_midi_after);
         if (!strcmp(drv_midi_before, drv_midi_after))

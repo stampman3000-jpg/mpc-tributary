@@ -9,13 +9,13 @@ It makes **no audio**. The plugin outputs silence. It is a feasibility step for 
 1. Lists every USB device the plugin can see, from sysfs. For each one it shows vendor and product ids, and each interface with its class, subclass and kernel driver.
 2. Finds a Digitone II: `1935:0b34` (Overbridge), `1935:1034` (Audio/MIDI) or `1935:0134` (MIDI).
 3. Opens its usbfs node and checks which kernel driver, if any, holds interface 1.
-4. Claims interface 1 (audio in) and interface 2 (audio out). It does not claim interface 4 or 5.
-5. Switches both to alt setting 3. It asks the device for its Overbridge name (two vendor reads), waits 100 ms, then sends silent blocks out of endpoint `0x03` (header `0x07ff`) while reading endpoint `0x83` for about a second. Finished transfers are collected directly, because `poll()` does not wake on this MPC when one completes. A good incoming packet is 1012 bytes, header `0x0700`, with the sample counter rising by 7. The log then shows a peak for main and for tracks 1 to 6. It then switches both interfaces back to alt setting 0 and releases them.
+4. Lets go of the kernel drivers on interface 4 (ordinary USB audio) and interface 5 (MIDI), sets USB configuration 1, then claims interface 1 (audio in) and interface 2 (audio out).
+5. Switches both to alt setting 3 and gives the kernel drivers on interfaces 4 and 5 back. It asks the device for its Overbridge name (two vendor reads), waits 100 ms, then sends silent blocks out of endpoint `0x03` (header `0x07ff`) while reading endpoint `0x83` for about a second. Finished transfers are collected directly, because `poll()` does not wake on this MPC when one completes. A good incoming packet is 1012 bytes, header `0x0700`, with the sample counter rising by 7. The log then shows a peak for main and for tracks 1 to 6. It then switches both interfaces back to alt setting 0 and releases them.
 6. Reports each step with the errno name (EBUSY, EACCES, ENOENT and so on).
-7. Checks that the MIDI interface (5) still has the same driver as before. It shows the result as `IF5 MIDI untouched` or `IF5 MIDI CHANGED!`.
+7. Checks that the MIDI interface (5) has its driver again. It shows `IF5 MIDI restored` when the same driver is back, or `IF5 MIDI CHANGED!` when it is not. If the drivers were never released, it shows `IF5 MIDI untouched`.
 8. Shows a short verdict on the plugin screen, and appends a full log to the MPC's drive.
 
-It never detaches a kernel driver, never resets the device, never sets a configuration, and never touches interfaces 4 or 5. A plugin scan does not run it: it runs only when you press **RUN PROBE**.
+It never resets the device. A plugin scan does not run it: it runs only when you press **RUN PROBE**.
 
 ## What is known about the Digitone II
 
