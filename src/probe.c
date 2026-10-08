@@ -373,6 +373,12 @@ static int endpoint_mps(const char *ifdir, const char *addr_want) {
     return mps;
 }
 
+static void clear_halt(int fd, unsigned int ep, plog_t *L) {
+    unsigned int e = ep;
+    if (ioctl(fd, USBDEVFS_CLEAR_HALT, &e) == 0) plog(L, "clear halt 0x%02x: OK", ep);
+    else plog(L, "clear halt 0x%02x: %s (%d) %s", ep, errname(errno), errno, strerror(errno));
+}
+
 /* Alt setting for one interface. Returns 0 on success, else errno. */
 static int set_alt(int fd, unsigned int ifnum, unsigned int alt, plog_t *L) {
     struct usbdevfs_setinterface si;
@@ -634,6 +640,8 @@ static void run_probe(probe_t *P) {
                     if (mps >= OP_OUT_BYTES && mps % OP_OUT_BYTES == 0 && mps <= 4096) out_bytes = mps;
                     if (mps >= OP_OUT_BYTES) {
                         exchanged = 1;
+                        clear_halt(fd, 0x83, &L);
+                        clear_halt(fd, 0x03, &L);
                         exchange_burst(fd, &L, out_bytes, audio_verdict, claim, rel);
                     } else {
                         snprintf(audio_verdict, sizeof audio_verdict, "OUT EP SMALL");
