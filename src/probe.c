@@ -16,6 +16,7 @@
  * when one completes. It never resets the device. Results go to the plugin readouts
  * and a log file.
  */
+#include <stdatomic.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -56,11 +57,31 @@
 #define TXT 24
 #define PATH_CAP 1024
 
+#define HEAR_PAIRS 4
+#define HEAR_CAP 16384
+#define HEAR_MASK (HEAR_CAP - 1)
+/* Digitone is 48 kHz. The MPC asks for 44.1 kHz. This step walks the Digitone
+ * stream at that ratio: one MPC sample takes a bit more than one Digitone sample. */
+#define HEAR_STEP ((48000u * 65536u) / 44100u)
+
 typedef struct {
     pthread_mutex_t lock;
     int runs;
+    int pair; /* 0 main, 1..3 tracks */
+    uint32_t rpos, rfrac;
+    int primed;
     char v[TXT], dev[TXT], claim[TXT], rel[TXT], mid[TXT], logst[TXT];
 } probe_t;
+
+/* One reader for the whole process. Instances only pick a pair. */
+static int16_t g_ring[HEAR_CAP][HEAR_PAIRS * 2];
+static atomic_uint g_w;
+static atomic_int g_stop;
+static atomic_int g_exited;
+static atomic_int g_alive;
+static pthread_t g_th;
+static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static probe_t *g_owner;
 
 typedef struct { char *buf; size_t len; } plog_t;
 
@@ -280,6 +301,21 @@ static int submit_urb(int fd, struct usbdevfs_urb *urb, unsigned char ep, void *
 
 /* 24-bit sample stored in 4 bytes. The audio may sit in the top three or the
  * bottom three; take whichever is louder. */
+/* Overbridge 2.1 stores a 24-bit sample in a 4-byte slot. The sample is bytes 1..3,
+ * big-endian. Adapted from Overwitch engine.c, Copyright (C) 2019 Stefan Rehm and
+ * Copyright (C) 2021 David García Goñi. The top 16 bits are what the MPC track can hold. */
+static int16_t ob_i16(const unsigned char *s) {
+    int v = (s[1] << 16) | (s[2] << 8) | s[3];
+    if (v & 0x800000) v -= 0x1000000;
+    return (int16_t)(v >> 8);
+}
+
+static const char *pair_name(int pair) {
+    static const char *names[HEAR_PAIRS] = { "main", "track 1", "track 2", "track 3" };
+    if (pair < 0 || pair >= HEAR_PAIRS) pair = 0;
+    return names[pair];
+}
+
 static int slot_peak(const unsigned char *s) {
     int hi = (s[0] << 16) | (s[1] << 8) | s[2];
     int lo = (s[1] << 16) | (s[2] << 8) | s[3];
@@ -704,7 +740,303 @@ static int save_log(const char *buf, size_t len, int *which) {
     return 0;
 }
 
+static void push_frames(const unsigned char *pkt) {
+    for (int f = 0; f < OP_FRAMES; f++) {
+        const unsigned char *fr = pkt + 32 + (size_t)f * OP_FRAME_BYTES;
+        uint32_t w = atomic_load_explicit(&g_w, memory_order_relaxed);
+        int16_t *dst = g_ring[w & HEAR_MASK];
+        for (int p = 0; p < HEAR_PAIRS; p++) {
+            const unsigned char *s = fr + (size_t)p * 8;
+            dst[p * 2] = ob_i16(s);
+            dst[p * 2 + 1] = ob_i16(s + 4);
+        }
+        atomic_store_explicit(&g_w, w + 1, memory_order_release);
+    }
+}
+
+static void hear_status(const char *v, const char *dev, const char *claim, const char *mid, const char *logst) {
+    pthread_mutex_lock(&g_mu);
+    probe_t *P = g_owner;
+    if (P) {
+        pthread_mutex_lock(&P->lock);
+        if (v) snprintf(P->v, TXT, "%s", v);
+        if (dev) snprintf(P->dev, TXT, "%s", dev);
+        if (claim) snprintf(P->claim, TXT, "%s", claim);
+        if (mid) snprintf(P->mid, TXT, "%s", mid);
+        if (logst) snprintf(P->logst, TXT, "%s", logst);
+        pthread_mutex_unlock(&P->lock);
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+
+/* Keep the same session the one-second probe uses, and leave it running.
+ * render() copies one stereo pair out of the ring. This thread is the only
+ * place that claims the Digitone. */
+static void *hear_thread(void *unused) {
+    (void)unused;
+    plog_t L = { malloc(LOG_CAP), 0 };
+    usbdev_t best = { 0 };
+    int elektron = 0, fd = -1, let4 = 0, let5 = 0;
+    int claimed = 0, if2_claimed = 0;
+    unsigned int ifn = IF_AUDIO_IN, if2 = IF_AUDIO_OUT;
+    char ifdir_audio[PATH_CAP] = "", ifdir_out[PATH_CAP] = "", ifdir_midi[PATH_CAP] = "";
+    char node[PATH_CAP] = "", drv_before[64] = "-";
+    int out_len = OP_BUNDLE * OP_OUT_BYTES;
+    int in_len = OP_BUNDLE * OP_PKT_BYTES;
+    unsigned char *in_mem = NULL, *out_mem = NULL;
+    struct usbdevfs_urb in_urb[OP_Q], out_urb[OP_Q];
+    int in_live[OP_Q], out_live[OP_Q];
+    uint16_t counter = 0;
+    uint32_t frames = 0;
+    struct timespec t0, last;
+    if (!L.buf) goto finish;
+    L.buf[0] = '\0';
+    memset(in_live, 0, sizeof in_live);
+    memset(out_live, 0, sizeof out_live);
+    plog(&L, "=== hear ===");
+    log_usb_tree(&L, &best, &elektron);
+    if (best.rank <= 0) {
+        hear_status(elektron ? "NO DIGITONE II PID" : "NO DIGITONE II SEEN", NULL, NULL, NULL, NULL);
+        plog(&L, "no Digitone II on the bus");
+        goto save;
+    }
+    {
+        char dev[TXT];
+        snprintf(dev, sizeof dev, "1935:%04x bus%d dev%d", (unsigned)best.pid, best.bus, best.addr);
+        hear_status("OPENING", dev, NULL, NULL, NULL);
+    }
+    if (!find_iface(best.name, IF_AUDIO_IN, ifdir_audio, sizeof ifdir_audio)) {
+        hear_status("D2 HAS NO IF1", NULL, NULL, NULL, NULL);
+        goto save;
+    }
+    if (attr_num(ifdir_audio, "bInterfaceClass", 16) == 1 &&
+        attr_num(ifdir_audio, "bInterfaceSubClass", 16) == 3) {
+        hear_status("IF1 IS MIDI, SKIPPED", NULL, NULL, NULL, NULL);
+        goto save;
+    }
+    if (find_iface(best.name, IF_MIDI, ifdir_midi, sizeof ifdir_midi))
+        driver_of(ifdir_midi, drv_before, sizeof drv_before);
+    if (usbfs_node(best.bus, best.addr, node, sizeof node, &L) != 0) {
+        hear_status("NO USBFS NODE", NULL, NULL, NULL, NULL);
+        goto save;
+    }
+    fd = open(node, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        hear_status("OPEN FAILED", NULL, NULL, NULL, NULL);
+        plog(&L, "open %s: FAILED %s", node, errname(errno));
+        goto save;
+    }
+    if (kernel_driver(fd, IF_CONTROL, 0, &L) == 0) let4 = 1;
+    if (kernel_driver(fd, IF_MIDI, 0, &L) == 0) let5 = 1;
+    set_config(fd, &L);
+    if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &ifn) != 0) {
+        hear_status(errno == EBUSY ? "BUSY: IF1 HELD" : "CLAIM FAILED", NULL, NULL, NULL, NULL);
+        plog(&L, "claim if1: FAILED %s", errname(errno));
+        goto save;
+    }
+    claimed = 1;
+    if (set_alt(fd, IF_AUDIO_IN, 3, &L) != 0 || !has_endpoint(ifdir_audio, "83")) {
+        hear_status("ALT3 FAILED", NULL, NULL, NULL, NULL);
+        goto save;
+    }
+    if (!find_iface(best.name, IF_AUDIO_OUT, ifdir_out, sizeof ifdir_out) ||
+        ioctl(fd, USBDEVFS_CLAIMINTERFACE, &if2) != 0) {
+        hear_status("IF2 CLAIM FAILED", NULL, NULL, NULL, NULL);
+        goto save;
+    }
+    if2_claimed = 1;
+    if (set_alt(fd, IF_AUDIO_OUT, 3, &L) != 0 || !has_endpoint(ifdir_out, "03")) {
+        hear_status("NO EP 0x03", NULL, NULL, NULL, NULL);
+        goto save;
+    }
+    clear_halt(fd, 0x83, &L);
+    clear_halt(fd, 0x03, &L);
+    give_drivers_back(fd, &let4, &let5, &L);
+    vendor_in(fd, 1, &L);
+    vendor_in(fd, 2, &L);
+    {
+        struct timespec pause = { 0, 100000000 };
+        nanosleep(&pause, NULL);
+    }
+    in_mem = calloc(OP_Q, (size_t)in_len);
+    out_mem = calloc(OP_Q, (size_t)out_len);
+    if (!in_mem || !out_mem) {
+        hear_status("NO PACKETS", NULL, NULL, NULL, NULL);
+        goto save;
+    }
+    for (int q = 0; q < OP_Q; q++) {
+        unsigned char *buf = out_mem + (size_t)q * out_len;
+        for (int i = 0; i < OP_BUNDLE; i++) {
+            fill_out_block(buf + (size_t)i * OP_OUT_BYTES, counter);
+            counter = (uint16_t)(counter + 7);
+        }
+        if (submit_urb(fd, &out_urb[q], 0x03, buf, out_len) == 0) out_live[q] = 1;
+        if (submit_urb(fd, &in_urb[q], 0x83, in_mem + (size_t)q * in_len, in_len) == 0) in_live[q] = 1;
+    }
+    hear_status("HEARING", NULL, "waiting", NULL, NULL);
+    plog(&L, "hearing: 24-block bundles, 4 stereo pairs");
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    last = t0;
+    while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
+        struct usbdevfs_urb *done = NULL;
+        struct timespec now;
+        int live = 0;
+        for (int q = 0; q < OP_Q; q++) live += in_live[q] + out_live[q];
+        if (!live) break;
+        if (ioctl(fd, USBDEVFS_REAPURBNDELAY, &done) < 0 || !done) {
+            if (errno != EAGAIN) {
+                plog(&L, "reap: %s (%d)", errname(errno), errno);
+                break;
+            }
+            struct timespec pause = { 0, 50000 };
+            nanosleep(&pause, NULL);
+        } else {
+            int qi = -1, qo = -1;
+            unsigned char *buf = done->buffer;
+            for (int q = 0; q < OP_Q; q++) {
+                if (done == &in_urb[q]) qi = q;
+                if (done == &out_urb[q]) qo = q;
+            }
+            if (qi >= 0) {
+                in_live[qi] = 0;
+                if (done->status == 0) {
+                    int off = 0;
+                    while (off + OP_PKT_BYTES <= done->actual_length) {
+                        if (load_be16(buf + off) == OP_HDR_MARK) {
+                            push_frames(buf + off);
+                            frames += OP_FRAMES;
+                        }
+                        off += OP_PKT_BYTES;
+                    }
+                }
+                if (!atomic_load_explicit(&g_stop, memory_order_relaxed) &&
+                    submit_urb(fd, &in_urb[qi], 0x83, buf, in_len) == 0)
+                    in_live[qi] = 1;
+            } else if (qo >= 0) {
+                out_live[qo] = 0;
+                if (done->status == 0 && !atomic_load_explicit(&g_stop, memory_order_relaxed)) {
+                    for (int i = 0; i < OP_BUNDLE; i++) {
+                        fill_out_block(buf + (size_t)i * OP_OUT_BYTES, counter);
+                        counter = (uint16_t)(counter + 7);
+                    }
+                    if (submit_urb(fd, &out_urb[qo], 0x03, buf, out_len) == 0) out_live[qo] = 1;
+                }
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int ms = (int)((now.tv_sec - last.tv_sec) * 1000 + (now.tv_nsec - last.tv_nsec) / 1000000);
+        if (ms >= 500) {
+            char claim[TXT];
+            uint32_t sec = (uint32_t)(now.tv_sec - t0.tv_sec);
+            last = now;
+            snprintf(claim, sizeof claim, "%us  %u fr", sec, frames);
+            hear_status("HEARING", NULL, claim, NULL, NULL);
+        }
+    }
+    cancel_live(fd, in_urb, in_live, OP_Q);
+    cancel_live(fd, out_urb, out_live, OP_Q);
+    plog(&L, "hear stop, frames %u", frames);
+
+save:
+    if (if2_claimed) {
+        set_alt(fd, IF_AUDIO_OUT, 0, &L);
+        if (ioctl(fd, USBDEVFS_RELEASEINTERFACE, &if2) == 0) plog(&L, "release if2: OK");
+    }
+    if (claimed) {
+        set_alt(fd, IF_AUDIO_IN, 0, &L);
+        if (ioctl(fd, USBDEVFS_RELEASEINTERFACE, &ifn) == 0) plog(&L, "release if1: OK");
+    }
+    if (fd >= 0) {
+        give_drivers_back(fd, &let4, &let5, &L);
+        close(fd);
+    }
+    if (ifdir_midi[0]) {
+        char after[64] = "-";
+        driver_of(ifdir_midi, after, sizeof after);
+        if (!strcmp(after, "none")) {
+            struct timespec pause = { 0, 50000000 };
+            nanosleep(&pause, NULL);
+            driver_of(ifdir_midi, after, sizeof after);
+        }
+        hear_status(NULL, NULL, NULL, !strcmp(drv_before, after) ? "IF5 MIDI restored" : "IF5 MIDI CHANGED!", NULL);
+        plog(&L, "-- after: if5 (MIDI) driver %s (was %s)", after, drv_before);
+    }
+    if (L.buf) {
+        int which = 0;
+        char logst[TXT] = "NOT SAVED";
+        if (save_log(L.buf, L.len, &which))
+            snprintf(logst, sizeof logst, "%s", which == 0 ? "saved: EOS_DIGITAL" : "saved: /sdcard");
+        hear_status(NULL, NULL, NULL, NULL, logst);
+        free(L.buf);
+    }
+    free(in_mem);
+    free(out_mem);
+finish:
+    atomic_store_explicit(&g_exited, 1, memory_order_release);
+    return NULL;
+}
+
+static void hear_join_locked(void) {
+    /* g_mu is held by the caller. Drop it across the join. */
+    pthread_t th = g_th;
+    int alive = atomic_load(&g_alive);
+    if (!alive) return;
+    if (!atomic_load(&g_exited)) atomic_store(&g_stop, 1);
+    pthread_mutex_unlock(&g_mu);
+    pthread_join(th, NULL);
+    pthread_mutex_lock(&g_mu);
+    atomic_store(&g_alive, 0);
+}
+
+static void hear_toggle(probe_t *P) {
+    pthread_mutex_lock(&g_mu);
+    if (atomic_load(&g_alive)) {
+        int dead = atomic_load(&g_exited);
+        hear_join_locked();
+        if (!dead) {
+            pthread_mutex_lock(&P->lock);
+            snprintf(P->v, TXT, "STOPPED");
+            pthread_mutex_unlock(&P->lock);
+            pthread_mutex_unlock(&g_mu);
+            return;
+        }
+    }
+    g_owner = P;
+    atomic_store(&g_w, 0);
+    atomic_store(&g_stop, 0);
+    atomic_store(&g_exited, 0);
+    P->primed = 0;
+    P->rpos = 0;
+    P->rfrac = 0;
+    pthread_mutex_lock(&P->lock);
+    snprintf(P->v, TXT, "OPENING");
+    snprintf(P->rel, TXT, "%s", pair_name(P->pair));
+    pthread_mutex_unlock(&P->lock);
+    if (pthread_create(&g_th, NULL, hear_thread, NULL) != 0) {
+        g_owner = NULL;
+        pthread_mutex_lock(&P->lock);
+        snprintf(P->v, TXT, "OPEN FAILED");
+        pthread_mutex_unlock(&P->lock);
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+    atomic_store(&g_alive, 1);
+    pthread_mutex_unlock(&g_mu);
+}
+
+static void hear_stop(void) {
+    pthread_mutex_lock(&g_mu);
+    if (atomic_load(&g_alive)) hear_join_locked();
+    pthread_mutex_unlock(&g_mu);
+}
+
 static void run_probe(probe_t *P) {
+    if (atomic_load(&g_alive) && !atomic_load(&g_exited)) {
+        pthread_mutex_lock(&P->lock);
+        snprintf(P->v, TXT, "BUSY: HEARING");
+        pthread_mutex_unlock(&P->lock);
+        return;
+    }
     plog_t L = { malloc(LOG_CAP), 0 };
     if (!L.buf) return;
     L.buf[0] = '\0';
@@ -982,10 +1314,10 @@ static void *create(const char *data_dir) {
     probe_t *P = calloc(1, sizeof *P);
     if (!P) return NULL;
     pthread_mutex_init(&P->lock, NULL);
-    snprintf(P->v, TXT, "press RUN PROBE");
+    snprintf(P->v, TXT, "press HEAR");
     snprintf(P->dev, TXT, "-");
     snprintf(P->claim, TXT, "-");
-    snprintf(P->rel, TXT, "-");
+    snprintf(P->rel, TXT, "main");
     snprintf(P->mid, TXT, "-");
     snprintf(P->logst, TXT, "-");
     return P;
@@ -994,6 +1326,10 @@ static void *create(const char *data_dir) {
 static void destroy(void *inst) {
     probe_t *P = inst;
     if (!P) return;
+    hear_stop();
+    pthread_mutex_lock(&g_mu);
+    if (g_owner == P) g_owner = NULL;
+    pthread_mutex_unlock(&g_mu);
     pthread_mutex_destroy(&P->lock);
     free(P);
 }
@@ -1004,6 +1340,16 @@ static void set_param(void *inst, const char *key, const char *val) {
     probe_t *P = inst;
     if (!P || !key || !val) return;
     if (!strcmp(key, "run") && atof(val) > 0.5) run_probe(P);
+    else if (!strcmp(key, "hear") && atof(val) > 0.5) hear_toggle(P);
+    else if (!strcmp(key, "pair")) {
+        int n = (int)atof(val);
+        if (n < 0) n = 0;
+        if (n >= HEAR_PAIRS) n = HEAR_PAIRS - 1;
+        pthread_mutex_lock(&P->lock);
+        P->pair = n;
+        snprintf(P->rel, TXT, "%s", pair_name(n));
+        pthread_mutex_unlock(&P->lock);
+    }
 }
 
 static int get_param(void *inst, const char *key, char *buf, int buf_len) {
@@ -1016,6 +1362,12 @@ static int get_param(void *inst, const char *key, char *buf, int buf_len) {
     else if (!strcmp(key, "p_rel")) src = P->rel;
     else if (!strcmp(key, "p_mid")) src = P->mid;
     else if (!strcmp(key, "p_log")) src = P->logst;
+    else if (!strcmp(key, "pair")) {
+        pthread_mutex_lock(&P->lock);
+        int n = snprintf(buf, buf_len, "%d", P->pair);
+        pthread_mutex_unlock(&P->lock);
+        return n;
+    }
     if (!src) return 0;
     pthread_mutex_lock(&P->lock);
     int n = snprintf(buf, buf_len, "%s", src);
@@ -1024,8 +1376,41 @@ static int get_param(void *inst, const char *key, char *buf, int buf_len) {
 }
 
 static void render(void *inst, int16_t *out_lr, int frames) {
-    (void)inst;
+    probe_t *P = inst;
+    if (!out_lr || frames < 1) return;
     memset(out_lr, 0, sizeof(int16_t) * 2 * (size_t)frames);
+    if (!P || !atomic_load_explicit(&g_alive, memory_order_acquire)) return;
+    if (atomic_load_explicit(&g_exited, memory_order_acquire)) return;
+    uint32_t w = atomic_load_explicit(&g_w, memory_order_acquire);
+    int pair = P->pair;
+    if (pair < 0 || pair >= HEAR_PAIRS) pair = 0;
+    if (!P->primed) {
+        if (w < 2048) return;
+        P->primed = 1;
+        P->rpos = w - 1024;
+        P->rfrac = 0;
+    }
+    if ((uint32_t)(w - P->rpos) > HEAR_CAP - 64) {
+        P->rpos = w - 1024;
+        P->rfrac = 0;
+    }
+    for (int i = 0; i < frames; i++) {
+        if ((uint32_t)(w - P->rpos) < 2) {
+            w = atomic_load_explicit(&g_w, memory_order_acquire);
+            if ((uint32_t)(w - P->rpos) < 2) break;
+        }
+        int i0 = (int)(P->rpos & HEAR_MASK);
+        int i1 = (int)((P->rpos + 1) & HEAR_MASK);
+        int frac = (int)(P->rfrac >> 8);
+        for (int ch = 0; ch < 2; ch++) {
+            int a = g_ring[i0][pair * 2 + ch];
+            int b = g_ring[i1][pair * 2 + ch];
+            out_lr[i * 2 + ch] = (int16_t)(a + ((b - a) * frac) / 256);
+        }
+        uint32_t acc = P->rfrac + HEAR_STEP;
+        P->rpos += acc >> 16;
+        P->rfrac = acc & 0xffff;
+    }
 }
 
 static const mpc_engine_t API = { create, destroy, midi, set_param, get_param, render };

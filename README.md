@@ -15,7 +15,9 @@ It makes **no audio**. The plugin outputs silence. It is a feasibility step for 
 7. Checks that the MIDI interface (5) has its driver again. It shows `IF5 MIDI restored` when the same driver is back, or `IF5 MIDI CHANGED!` when it is not. If the drivers were never released, it shows `IF5 MIDI untouched`.
 8. Shows a short verdict on the plugin screen, and appends a full log to the MPC's drive.
 
-It never resets the device. A plugin scan does not run it: it runs only when you press **RUN PROBE**.
+It never resets the device. A plugin scan does not run it.
+
+**HEAR** keeps that same USB session open and plays one stereo pair on the track the plugin sits on. The PAIR knob chooses main, track 1, track 2, or track 3. The Digitone runs at 48 kHz and the MPC track at 44.1 kHz, so each MPC sample takes a small step along the Digitone stream. Press **HEAR** again to stop and release the Digitone. **RUN PROBE** is still the one-second measurement. Leave HEAR off before you press it.
 
 This program is free software under the GNU General Public License, version 3. See `LICENSE`.
 

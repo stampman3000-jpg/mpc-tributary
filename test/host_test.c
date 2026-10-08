@@ -236,6 +236,34 @@ int main(void) {
         check(st.peak[2] > 0 && st.counter_gaps == 0, "track 1 level is counted and the counter still steps by 7");
     }
 
+    {
+        unsigned char slot[4] = { 0x00, 0x10, 0x00, 0x00 };
+        check(ob_i16(slot) == 4096, "a 4-byte Overbridge slot becomes a 16-bit sample");
+    }
+    e->set_param(inst, "pair", "2");
+    check(e->get_param(inst, "pair", r[0], 64) > 0 && !strcmp(r[0], "2"), "pair selector stores track 2");
+    e->get_param(inst, "p_rel", r[0], 64);
+    check(!strcmp(r[0], "track 2"), "pair selector names track 2");
+    {
+        int16_t silence[256];
+        memset(silence, 0x5a, sizeof silence);
+        e->render(inst, silence, 128);
+        int quiet = 1;
+        for (int i = 0; i < 256; i++) if (silence[i]) quiet = 0;
+        check(quiet, "render is silence until HEAR is running");
+    }
+    reset_fixture();
+    e->set_param(inst, "hear", "1");
+    {
+        int saw = 0;
+        for (int i = 0; i < 50; i++) {
+            e->get_param(inst, "p_v", r[0], 64);
+            if (!strcmp(r[0], "NO DIGITONE II SEEN")) { saw = 1; break; }
+            usleep(20000);
+        }
+        check(saw, "HEAR on an empty bus reports that no Digitone II was seen");
+    }
+
     char buf[64] = "";
     check(e->get_param(inst, "run", buf, sizeof buf) == 0, "trigger key has no readout text");
     check(e->get_param(inst, "state", buf, sizeof buf) == 0, "no state chunk is saved");
