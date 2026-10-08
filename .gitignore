@@ -1,0 +1,5 @@
+vst/build/
+*.so
+*.log
+*.o
+.DS_Store
