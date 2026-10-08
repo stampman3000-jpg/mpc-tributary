@@ -207,6 +207,7 @@ static int32_t load_be32(const unsigned char *p) {
                      ((uint32_t)p[2] << 8) | p[3]);
 }
 
+static void view_burst(const unsigned char *pkts, const int *lens, int n, struct burst_view *v) __attribute__((unused));
 static void view_burst(const unsigned char *pkts, const int *lens, int n, struct burst_view *v) {
     memset(v, 0, sizeof *v);
     v->n = n;
