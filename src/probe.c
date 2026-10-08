@@ -130,6 +130,7 @@ static const char *errname(int e) {
     case ENOMEM: return "ENOMEM";
     case ETIMEDOUT: return "ETIMEDOUT";
     case EPIPE: return "EPIPE";
+    case EAGAIN: return "EAGAIN";
     default: return "other";
     }
 }
@@ -313,15 +314,25 @@ static void exchange_burst(int fd, plog_t *L, int out_bytes, char *verdict, char
 
     for (int spin = 0; spin < 48 && got < OP_BURST && (in_flight || out_flight); spin++) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        struct usbdevfs_urb *primed = NULL;
         int pr = poll(&pfd, 1, got ? 40 : 200);
+        /* poll() should wake when a transfer finishes. If it does not, a finished
+         * transfer can still be waiting; take that one and count it. */
         if (pr <= 0) {
-            if (++misses >= 2) break;
-            continue;
+            if (ioctl(fd, USBDEVFS_REAPURBNDELAY, &primed) == 0 && primed) {
+                plog(L, "a transfer finished while poll was idle, ep 0x%02x status %d len %d",
+                     primed->endpoint, primed->status, primed->actual_length);
+            } else {
+                plog(L, "no finished transfer waiting: %s", errname(errno));
+                if (++misses >= 2) break;
+                continue;
+            }
         }
         misses = 0;
         for (;;) {
-            struct usbdevfs_urb *done = NULL;
-            if (ioctl(fd, USBDEVFS_REAPURBNDELAY, &done) < 0) break;
+            struct usbdevfs_urb *done = primed;
+            primed = NULL;
+            if (!done && ioctl(fd, USBDEVFS_REAPURBNDELAY, &done) < 0) break;
             if (done == &in_urb) {
                 in_flight = 0;
                 if (in_urb.status == 0) {
