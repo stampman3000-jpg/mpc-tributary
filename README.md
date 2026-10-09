@@ -79,7 +79,7 @@ sh test/run.sh
 ## Limits
 
 - One stereo pair, or one mono channel, per copy of the plugin.
-- The Digitone runs at 48 kHz. The MPC track runs at 44.1 kHz. Tributary walks the Digitone stream at that ratio, from a few milliseconds behind the newest sample.
+- The audio can sit a little late against the MPC grid. The Digitone runs at 48 kHz and the MPC track at 44.1 kHz, and Tributary plays from a few milliseconds behind the newest USB sample so a late packet does not become a gap. The plugin cannot shift the MPC's other tracks to match. USB or DIN, and which machine is the clock, do not remove that wait. The spare is `HEAR_LAG` in `src/probe.c` if a later change wants to try a shorter one.
 - One USB read is shared. Only the sources that are actually active are decoded.
 - Other Overbridge machines are listed and untested.
 - The Digitone clock over this same cable wobbles. Use the MPC as the clock.
