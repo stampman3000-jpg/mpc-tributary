@@ -1,11 +1,12 @@
 {
-  "name": "Overprobe",
+  "name": "Tributary",
   "vendor": "johnny",
-  "uid": "Ovpr",
+  "uid": "Trib",
   "version": 1000,
-  "so": "overprobe.so",
+  "so": "tributary.so",
   "params": "params.json",
   "layout": "layout.conf",
+  "art": "html",
   "build": {
     "root": "..",
     "sources": [

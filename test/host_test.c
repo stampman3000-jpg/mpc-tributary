@@ -6,7 +6,7 @@
 #define OP_SYSFS_USB "/tmp/opfix/sys/devices"
 #define OP_DEV_USB "/tmp/opfix/dev/bus/usb"
 #define OP_PROC_USB "/tmp/opfix/proc/bus/usb"
-#define OP_LOG_PATHS "/tmp/opfix-nodir/x.log", "/tmp/opfix-log/mpc-overprobe.log"
+#define OP_LOG_PATHS "/tmp/opfix-nodir/x.log", "/tmp/opfix-log/tributary.log"
 
 #include "../src/probe.c"
 
@@ -93,7 +93,7 @@ static void readouts(const void *e_inst, const mpc_engine_t *e, char out[6][64])
 }
 
 static int log_has(const char *needle) {
-    FILE *f = fopen("/tmp/opfix-log/mpc-overprobe.log", "r");
+    FILE *f = fopen("/tmp/opfix-log/tributary.log", "r");
     if (!f) return 0;
     static char buf[LOG_CAP];
     size_t n = fread(buf, 1, sizeof buf - 1, f);
@@ -113,7 +113,7 @@ int main(void) {
     check(!strcmp(r[0], "NO DIGITONE II SEEN"), "empty bus: verdict says no Digitone II");
     check(!strcmp(r[1], "nothing found"), "empty bus: device readout");
     check(!strcmp(r[5], "saved: /sdcard") || !strcmp(r[5], "saved: EOS_DIGITAL"), "log falls back to a second path when the first is missing");
-    check(log_has("=== mpc-overprobe run 1"), "log file has run 1 header (via fallback path)");
+    check(log_has("=== tributary run 1"), "log file has run 1 header (via fallback path)");
 
     reset_fixture();
     add_device("3-1", "1935\n", "0b34\n", 3, 5);
@@ -242,10 +242,37 @@ int main(void) {
         check(ob_i16(slot) == 4096, "a 4-byte Overbridge slot becomes a 16-bit sample");
         check(ob_i16_3(narrow) == 0x1234, "a 3-byte Overbridge slot becomes a 16-bit sample");
     }
+    {
+        const tb_dev *dn = tb_by_pid(0x0b34);
+        const tb_dev *dt = tb_by_pid(0x0b2c);
+        unsigned char pkt[OP_PKT_BYTES];
+        int off;
+        check(dn && dn->tested && tb_in_block(dn) == 1012 && tb_out_block(dn) == 256,
+              "Digitone II blocks are 1012 in and 256 out");
+        check(dt && !dt->tested && dt->nsrc == 10 && dt->src[1].stereo == 0,
+              "Digitakt has 10 sources and mono tracks, and is untested");
+        check(tb_by_pid(0x0b35) && !tb_by_pid(0x0b35)->tested, "Digitone Keys is listed and untested");
+        check(tb_by_pid(0x0b4a) && tb_by_pid(0x0b4a)->nsrc == 16, "Syntakt is listed");
+        memset(pkt, 0, sizeof pkt);
+        off = dt->src[1].off;
+        pkt[32 + off + 1] = 0x20;
+        g_dev = dt;
+        for (int i = 0; i < TB_MAX; i++) atomic_store(&g_use[i], 0);
+        atomic_store(&g_use[1], 1);
+        atomic_store(&g_w, 0);
+        push_frames(pkt);
+        check(g_ring[0][2] != 0 && g_ring[0][2] == g_ring[0][3] && g_ring[0][0] == 0,
+              "a mono track is copied to both sides and unused sources stay quiet");
+        g_dev = NULL;
+        for (int i = 0; i < TB_MAX; i++) atomic_store(&g_use[i], 0);
+        atomic_store(&g_lamp, 0);
+    }
     e->set_param(inst, "pair", "2");
     check(e->get_param(inst, "pair", r[0], 64) > 0 && !strcmp(r[0], "2"), "pair selector stores track 2");
     e->get_param(inst, "p_rel", r[0], 64);
     check(!strcmp(r[0], "track 2"), "pair selector names track 2");
+    e->get_param(inst, "srcname", r[0], 64);
+    check(!strcmp(r[0], "track 2"), "source name reads track 2");
     {
         int16_t silence[256];
         memset(silence, 0x5a, sizeof silence);
@@ -264,6 +291,9 @@ int main(void) {
         memset(pkt, 0, sizeof pkt);
         pkt[32 + 1] = 0x10; /* main L */
         pkt[32 + off] = 0x40; /* delay L */
+        for (i = 0; i < TB_MAX; i++) atomic_store(&g_use[i], 0);
+        atomic_store(&g_use[0], 1);
+        atomic_store(&g_use[17], 1);
         atomic_store(&g_w, 0);
         for (i = 0; i < 300; i++) push_frames(pkt);
         atomic_store(&g_exited, 0);
@@ -273,6 +303,10 @@ int main(void) {
         e->set_param(other, "pair", "17");
         e->get_param(other, "p_rel", r[0], 64);
         check(!strcmp(r[0], "delay") && size == 3 && off == 116, "delay is the 3-byte pair after the tracks");
+        e->set_param(inst, "active", "1");
+        e->set_param(inst, "active", "1");
+        check(atomic_load(&g_alive) == 1, "ACTIVE on again does not stop the stream");
+        e->set_param(other, "active", "1");
         e->render(inst, out, 128);
         for (i = 0; i < 256; i++) {
             int a = out[i] < 0 ? -out[i] : out[i];
@@ -285,6 +319,8 @@ int main(void) {
         }
         check(main_peak > 1000 && delay_peak > 1000 && main_peak != delay_peak,
               "two copies play different pairs from the same blocks");
+        e->set_param(other, "active", "0");
+        check(atomic_load(&g_alive) == 1, "a follower turning ACTIVE off leaves the read running");
         e->destroy(other);
         check(atomic_load(&g_alive) == 1, "removing one copy leaves the shared read running");
         atomic_store(&g_alive, 0);
