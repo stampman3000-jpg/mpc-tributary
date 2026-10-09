@@ -65,6 +65,8 @@ A log is appended to `/media/EOS_DIGITAL/tributary.log` (or `/sdcard/tributary.l
 
 ## Build
 
+The VST2 wrapper and entrypoint are not in this repo. They come from [sd88me/mpc-vst-plugins](https://github.com/sd88me/mpc-vst-plugins) (`tools/build_port.sh`), so clone that alongside to build.
+
 The plugin description is `vst/vst.json`. The engine is `src/probe.c` and `src/devices.h`. The VST2 wrapper (`vst2_wrap.c`) stays in [sd88me/mpc-vst-plugins](https://github.com/sd88me/mpc-vst-plugins) and is not copied into this repo. `vst.json` tells that toolchain the flags:
 
 - compile: `-pthread`
