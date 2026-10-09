@@ -68,8 +68,13 @@ static int repair_seq_link(void);
 #define HEAR_CAP 16384
 #define HEAR_MASK (HEAR_CAP - 1)
 /* Digitone is 48 kHz. The MPC asks for 44.1 kHz. This step walks the Digitone
- * stream at that ratio: one MPC sample takes a bit more than one Digitone sample. */
+ * stream at that ratio: one MPC sample takes a bit more than one Digitone sample.
+ * Playback sits HEAR_LAG frames behind the newest sample, about 5 ms. One USB
+ * bundle is 3.5 ms, so this is a little more than one bundle of spare. If the
+ * read falls further behind than HEAR_LAG * 4 it jumps forward again, instead
+ * of drifting out toward the whole ring. */
 #define HEAR_STEP ((48000u * 65536u) / 44100u)
+#define HEAR_LAG 256
 
 typedef struct {
     pthread_mutex_t lock;
@@ -1699,13 +1704,13 @@ static void render(void *inst, int16_t *out_lr, int frames) {
     int pair = P->pair;
     if (pair < 0 || pair >= src_lim()) pair = 0;
     if (!P->primed) {
-        if (w < 2048) return;
+        if (w < HEAR_LAG) return;
         P->primed = 1;
-        P->rpos = w - 1024;
+        P->rpos = w - HEAR_LAG;
         P->rfrac = 0;
     }
-    if ((uint32_t)(w - P->rpos) > HEAR_CAP - 64) {
-        P->rpos = w - 1024;
+    if ((uint32_t)(w - P->rpos) > HEAR_LAG * 4) {
+        P->rpos = w - HEAR_LAG;
         P->rfrac = 0;
     }
     for (int i = 0; i < frames; i++) {
