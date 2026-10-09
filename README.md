@@ -1,15 +1,24 @@
 # Tributary
 
-Plays one output from an Elektron Digitone II, over USB, on the MPC track the plugin sits on. That track goes to the MPC main like any instrument. Put Stream on the same track if you want a copy on the Mac. Nothing is recorded inside the plugin, and it does not need a second track.
+A small Overwitch rework for MPC standalone. It plays one Overbridge output from an Elektron Digitone II, over USB, on the MPC track the plugin sits on.
 
-Several copies can sit on several tracks. They share one USB read. Each copy plays one stereo pair, or one mono channel sent to both sides.
+Demo: https://youtu.be/QJIlWZKR8m0
+
+Several copies can sit on several tracks. They share one USB read. Each copy plays one stereo pair, or one mono channel sent to both sides. Levels stay on the Digitone.
+
+## Caveats
+
+- There is a small amount of latency. Tributary plays from a few milliseconds behind the newest USB sample, so a late packet does not become a gap. That can leave the audio a little late against the MPC grid. The plugin cannot shift the other tracks to match. USB or DIN, and which machine is the clock, do not remove that wait. The spare is `HEAR_LAG` in `src/probe.c`.
+- Eight copies is the maximum in one project unless Hakai is installed. That is the MPC's own plugin limit.
+- Other Overbridge machines are listed and untested. Only the Digitone II has been heard. Testers are welcome. Analog Keys is not in this build. It uses the older Overbridge link, and Tributary only speaks the interrupt one.
+- You can only listen on the plugin track. The sound comes out of the track Tributary sits on. It is not a separate USB audio device, and one copy does not play every output at once.
+- Recording needs a resample. The sound is live USB audio, so a bounce does not capture it. Resample the track, or a submix, with the MPC sampler while it plays.
+- Use the MPC as the clock. Set the Digitone to follow MIDI clock and press play on the MPC. The Digitone can be the clock instead. Play and tempo do reach the MPC, and they wobble, because the clock shares the USB cable with the audio. The screen says **MPC is the clock** along the bottom for this reason.
 
 ## What you need
 
 - A Digitone II on OS 1.10A or newer, set to Overbridge, plugged into the MPC's USB host port.
-- The MPC as the clock. Set the Digitone to follow MIDI clock, and press play on the MPC.
-
-The Digitone can be the clock instead. Play and tempo do reach the MPC, and they wobble. Its clock shares the USB cable with the audio, so the ticks arrive in bunches and the MPC keeps catching up. The screen says **MPC is the clock** along the bottom for this reason. The title of the plugin is Tributary.
+- The MPC as the clock.
 
 ## On the screen
 
@@ -19,21 +28,13 @@ The light is the session:
 - **Amber** means it is connecting.
 - **Green** means audio is coming in.
 
-**SOURCE** picks which output this copy plays. On a Digitone II that is main, tracks 1 to 16, delay, reverb, chorus, and the inputs.
+**SOURCE** picks which output this copy plays. On a Digitone II that is main, tracks 1 to 16, delay, reverb, chorus, and the inputs. One click of the jog wheel or a Q-link moves one output. A finger on the knob jumps to the output it lands on.
 
 **ACTIVE** turns this copy on or off. The first copy to turn on opens the USB stream. Another copy just joins that stream. Turning **ACTIVE** off on the copy that opened it lets the Digitone go. Turning it off on another copy mutes that copy only.
 
 Take the plugin off the track when you are finished. The last copy releases the audio interfaces. The Digitone's MIDI interface is left on its driver the whole time, and loading Tributary wires the sequencer link between the Digitone and the MPC.
 
-## How to record
-
-The sound is live USB audio, so a normal bounce does not capture it. Resample the track, or a submix, with the MPC sampler while it plays.
-
-## Other Elektron machines
-
-The SOURCE list comes from the device that is plugged in. Layouts for Digitakt, Digitakt II, Digitone, Digitone Keys, Syntakt, Analog Rytm MKII, Analog Four MKII, and Analog Heat (including MKII and +FX) are included from Overwitch's device list. Only the Digitone II has been heard with this plugin. The others are untested. Testers are welcome.
-
-Analog Keys is not in this build. It uses the older Overbridge link, and Tributary only speaks the interrupt one used by the machines above.
+The SOURCE list follows the connected device. Layouts for Digitakt, Digitakt II, Digitone, Digitone Keys, Syntakt, Analog Rytm MKII, Analog Four MKII, and Analog Heat (including MKII and +FX) are included from Overwitch's device list. They are untested.
 
 ## Install
 
@@ -76,14 +77,9 @@ The host test checks the USB decisions and the device table on a fake bus. It ne
 sh test/run.sh
 ```
 
-## Limits
+## Further development
 
-- One stereo pair, or one mono channel, per copy of the plugin.
-- The audio can sit a little late against the MPC grid. The Digitone runs at 48 kHz and the MPC track at 44.1 kHz, and Tributary plays from a few milliseconds behind the newest USB sample so a late packet does not become a gap. The plugin cannot shift the MPC's other tracks to match. USB or DIN, and which machine is the clock, do not remove that wait. The spare is `HEAR_LAG` in `src/probe.c` if a later change wants to try a shorter one.
-- One USB read is shared. Only the sources that are actually active are decoded.
-- Other Overbridge machines are listed and untested.
-- The Digitone clock over this same cable wobbles. Use the MPC as the clock.
-- The screen can lag by one audio block. The log is the record of what the USB session did.
+This is a first version that has been heard on one Digitone II. It would be good to see other people take it further: a shorter wait, other Overbridge machines, more than one output from a single copy.
 
 ## Licence
 
