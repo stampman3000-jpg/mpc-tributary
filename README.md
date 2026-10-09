@@ -2,7 +2,9 @@
 
 A small Overwitch rework for MPC standalone. It plays one Overbridge output from an Elektron Digitone II, over USB, on the MPC track the plugin sits on.
 
-Demo: https://youtu.be/QJIlWZKR8m0
+[![Tributary demo](https://img.youtube.com/vi/QJIlWZKR8m0/hqdefault.jpg)](https://youtu.be/QJIlWZKR8m0)
+
+[Demo](https://youtu.be/QJIlWZKR8m0)
 
 Several copies can sit on several tracks. They share one USB read. Each copy plays one stereo pair, or one mono channel sent to both sides. Levels stay on the Digitone.
 
