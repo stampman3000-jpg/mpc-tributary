@@ -1,8 +1,12 @@
 # mpc-overprobe
 
-A throwaway probe for one question: can a plugin running on an Akai MPC open and claim the Overbridge audio interface of an Elektron Digitone II (plugged into the MPC's USB host port), while the Digitone's MIDI interface keeps working?
+Plays one stereo pair from an Elektron Digitone II over USB, on the MPC track the plugin sits on. That track goes to the MPC main like any instrument. Stream on the same track copies it to the Mac. Nothing is recorded, and there is no second track.
 
-It makes **no audio**. The plugin outputs silence. It is a feasibility step for a later plugin that plays the Digitone II's audio on the track the plugin sits on. That track goes to the MPC main like any instrument. Stream on the same track copies it to the Mac. Nothing is recorded, and there is no second track.
+## Clock
+
+Use the MPC as the clock. Set the Digitone to follow MIDI clock, and press play on the MPC. That stays steady.
+
+The Digitone can be the clock instead. Play and tempo do reach the MPC, and they wobble. Its clock shares the USB cable with the audio stream, so the ticks arrive in bunches and the MPC keeps catching up. The plugin screen says **MPC IS THE CLOCK** for this reason.
 
 ## What it does
 
@@ -102,7 +106,7 @@ These steps assume the layout used for Stream and Chop: plugin files in the Synt
 
    Back up `MPC.settings` first and stop the MPC software before editing it. The file location on the MPC One was not verified for this build, so check it on your unit first.
 
-3. Run it. Plug the Digitone II into the MPC's USB host port before you start. Insert Overprobe on a track, open its screen, and press **RUN PROBE**. Use an empty track, because the plugin outputs silence.
+3. Run it. Plug the Digitone II into the MPC's USB host port before you start. Insert Overprobe on a track, open its screen, and press **HEAR**. Use the MPC as the clock.
 
 4. Read the verdict on the screen. Then copy the full log off the MPC (or take the drive to the Mac):
 
