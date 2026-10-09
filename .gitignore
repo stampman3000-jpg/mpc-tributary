@@ -1,4 +1,5 @@
 vst/build/
+dist/
 *.so
 *.log
 *.o

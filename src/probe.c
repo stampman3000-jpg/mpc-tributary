@@ -40,6 +40,16 @@
 #include <linux/usbdevice_fs.h>
 #include "devices.h"
 
+/* The transfer structs are the ones in <linux/usbdevice_fs.h>. Their buffer
+ * pointers are native pointers, so a 64-bit build is not a 32-bit layout with
+ * the sizes written out by hand. */
+_Static_assert(sizeof(((struct usbdevfs_urb *)0)->buffer) == sizeof(void *),
+               "usbdevfs_urb.buffer must be a native pointer");
+_Static_assert(sizeof(((struct usbdevfs_ctrltransfer *)0)->data) == sizeof(void *),
+               "usbdevfs_ctrltransfer.data must be a native pointer");
+_Static_assert(sizeof(((struct usbdevfs_ioctl *)0)->data) == sizeof(void *),
+               "usbdevfs_ioctl.data must be a native pointer");
+
 static int repair_seq_link(void);
 
 #ifndef OP_SYSFS_USB
@@ -1437,6 +1447,8 @@ done:
     free(L.buf);
 }
 
+/* Used only when the C library headers omit these. 434 and 438 are the numbers
+ * in both the 32-bit ARM and the AArch64 Linux syscall tables. */
 #ifndef __NR_pidfd_open
 #define __NR_pidfd_open 434
 #endif

@@ -30,6 +30,8 @@ The light is the session:
 
 **SOURCE** picks which output this copy plays. On a Digitone II that is main, tracks 1 to 16, delay, reverb, chorus, and the inputs. One click of the jog wheel or a Q-link moves one output. A finger on the knob jumps to the output it lands on.
 
+The rendered screen is `screenshots/tributary.png`. The artwork and the lamp frames live in `vst/art/`. The skin layout is `vst/layout.conf` and `vst/skin.css`.
+
 **ACTIVE** turns this copy on or off. The first copy to turn on opens the USB stream. Another copy just joins that stream. Turning **ACTIVE** off on the copy that opened it lets the Digitone go. Turning it off on another copy mutes that copy only.
 
 Take the plugin off the track when you are finished. The last copy releases the audio interfaces. The Digitone's MIDI interface is left on its driver the whole time, and loading Tributary wires the sequencer link between the Digitone and the MPC.
@@ -49,7 +51,7 @@ These steps assume the same layout as Stream: plugin files in the Synths folder 
    tar -C vst/build/skin -cf - "johnny - VST - Tributary" | ssh root@<MPC> "tar -C /media/EOS_DIGITAL/Synths -xf -"
    ```
 
-2. Register it once, if the MPC does not already list it. Plugins are named in `pluginList-arm` inside `MPC.settings`. Back that file up first. The line looks like this, with the path on your drive:
+2. Register it once, if the MPC does not already list it. On a 32-bit MPC the list is `pluginList-arm`. On a Gen2 / AArch64 MPC it is `pluginList-arm-64bit`. The release installer picks the one that matches the package. Back up `MPC.settings` first. The line looks like this, with the path on your drive:
 
    ```
    <PLUGIN name="Tributary" descriptiveName="Tributary" format="VST" category="Synth" manufacturer="johnny" version="1.0" file="/media/EOS_DIGITAL/Synths/johnny - VST - Tributary/tributary.so" uid="54726962" isInstrument="1" fileTime="0" infoUpdateTime="0" numInputs="0" numOutputs="2" isShell="0"/>
@@ -63,13 +65,53 @@ A log is appended to `/media/EOS_DIGITAL/tributary.log` (or `/sdcard/tributary.l
 
 ## Build
 
-You need Docker and a checkout of [sd88me/mpc-vst-plugins](https://github.com/sd88me/mpc-vst-plugins).
+The plugin description is `vst/vst.json`. The engine is `src/probe.c` and `src/devices.h`. The VST2 wrapper (`vst2_wrap.c`) stays in [sd88me/mpc-vst-plugins](https://github.com/sd88me/mpc-vst-plugins) and is not copied into this repo. `vst.json` tells that toolchain the flags:
+
+- compile: `-pthread`
+- link: `-pthread -lm`
+
+`-lm` is required because the wrapper uses `libm`. USB transfer structs come from `<linux/usbdevice_fs.h>`. Nothing in this repo writes out a 32-bit `usbdevfs` size or pointer.
+
+You need Docker. Set `MPC_VST` to a checkout of mpc-vst-plugins. Both commands below use the same flags. The architecture is the compiler image.
+
+32-bit ARM, for `pluginList-arm` (the `v1.0.0` zip). `build_port.sh` runs this, and also draws the skin:
 
 ```
 "$MPC_VST/tools/build_port.sh" "$PWD/vst/vst.json"
 ```
 
-Output goes to `vst/build/` (not part of the release): `tributary.so` and `skin/johnny - VST - Tributary/`.
+The compile itself, with `arm32v7/gcc:12` (`--platform linux/arm/v7`, compiler `arm-linux-gnueabihf`):
+
+```
+docker run --rm --platform linux/arm/v7 -v "$PWD":/src -v "$MPC_VST":/mv:ro -w /src arm32v7/gcc:12 \
+  gcc -O2 -Wall -Wextra -Wno-unused-parameter -fPIC -shared -fvisibility=hidden -std=gnu11 \
+      -pthread -Ivst/build \
+      src/probe.c /mv/wrapper/vst2_wrap.c \
+      -pthread -lm -Wl,--no-undefined \
+      -o vst/build/tributary.so
+```
+
+AArch64, for `pluginList-arm-64bit` on a Gen2 MPC. Same flags, `arm64v8/gcc:12` (`--platform linux/arm64`, compiler `aarch64-linux-gnu`):
+
+```
+docker run --rm --platform linux/arm64 -v "$PWD":/src -v "$MPC_VST":/mv:ro -w /src arm64v8/gcc:12 \
+  gcc -O2 -Wall -Wextra -Wno-unused-parameter -fPIC -shared -fvisibility=hidden -std=gnu11 \
+      -pthread -Ivst/build \
+      src/probe.c /mv/wrapper/vst2_wrap.c \
+      -pthread -lm -Wl,--no-undefined \
+      -o vst/build/tributary-aarch64.so
+```
+
+`vst/build/params.h` has to exist before that gcc line (the wrapper includes it). `build_port.sh` writes it. Output under `vst/build/` is not part of the git tree.
+
+Pack a zip (the `.so` stays out of git; it only goes in the zip):
+
+```
+python3 tools/pack_release.py --so vst/build/tributary.so \
+  --skin "vst/build/skin/johnny - VST - Tributary" --arch armv7 --version 1.0.0
+```
+
+`--arch aarch64` writes `pluginList-arm-64bit` instead of `pluginList-arm`.
 
 The host test checks the USB decisions and the device table on a fake bus. It needs Linux headers, so it runs in a container:
 
