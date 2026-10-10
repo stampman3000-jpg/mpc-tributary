@@ -3,6 +3,27 @@
     {"key": "source", "name": "Source", "min": 0, "max": 20, "default": 0, "options": ["main", "track 1", "track 2", "track 3", "track 4", "track 5", "track 6", "track 7", "track 8", "track 9", "track 10", "track 11", "track 12", "track 13", "track 14", "track 15", "track 16", "delay", "reverb", "chorus", "input"]},
     {"key": "active", "name": "Active", "min": 0, "max": 1, "default": 0},
     {"key": "lamp", "name": "Lamp", "min": 0, "max": 2, "default": 0, "options": ["red", "amber", "green"]},
-    {"key": "srcname", "name": "Source name", "min": 0, "max": 1, "default": 0, "display": "string"}
+    {"key": "srcname", "name": "On", "min": 0, "max": 1, "default": 0, "display": "string"},
+    {"key": "s0", "name": "MAIN", "min": 0, "max": 1, "default": 1, "dynamic_name": true},
+    {"key": "s1", "name": "1", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s2", "name": "2", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s3", "name": "3", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s4", "name": "4", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s5", "name": "5", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s6", "name": "6", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s7", "name": "7", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s8", "name": "8", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s9", "name": "9", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s10", "name": "10", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s11", "name": "11", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s12", "name": "12", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s13", "name": "13", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s14", "name": "14", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s15", "name": "15", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s16", "name": "16", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s17", "name": "DLY", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s18", "name": "REV", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s19", "name": "CHO", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "s20", "name": "IN", "min": 0, "max": 1, "default": 0, "dynamic_name": true}
   ]
 }

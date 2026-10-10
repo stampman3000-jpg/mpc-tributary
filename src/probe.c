@@ -1,4 +1,4 @@
-/* Tributary: play one Overbridge output on the MPC track this plugin sits on.
+/* Tributary: sum chosen Overbridge outputs onto the MPC track this plugin sits on.
  *
  * Copyright (C) 2026 Stampman3000
  * This program is free software under the GNU General Public License, version 3.
@@ -12,11 +12,12 @@
  * interface 5 (MIDI) on their kernel drivers. Dropping the MIDI driver recreates
  * the sound card: the MPC still lists the port, but the sequencer link drops, so
  * play and clock never arrive. Loading the plugin wires that link again. One
- * thread sends silent 24-block bundles out of endpoint 0x03 and reads endpoint
+ * thread sends silent 4-block bundles out of endpoint 0x03 and reads endpoint
  * 0x83. It decodes only the sources the open copies are actually playing. Finished
  * transfers are collected directly: on this MPC, poll() does not wake when one
  * completes. It never resets the device. Stopping puts both interfaces back to
- * alt 0 and releases them. A log is appended on the MPC drive.
+ * alt 0 and releases them. The card log is written when a session fails to open,
+ * and when the one-second check runs. A healthy stream does not keep writing.
  */
 #include <stdatomic.h>
 #include <dirent.h>
@@ -79,22 +80,27 @@ static int repair_seq_link(void);
 #define HEAR_MASK (HEAR_CAP - 1)
 /* Digitone is 48 kHz. The MPC asks for 44.1 kHz. This step walks the Digitone
  * stream at that ratio: one MPC sample takes a bit more than one Digitone sample.
- * Playback sits HEAR_LAG frames behind the newest sample, about 5 ms. One USB
- * bundle is 3.5 ms, so this is a little more than one bundle of spare. If the
- * read falls further behind than HEAR_LAG * 4 it jumps forward again, instead
- * of drifting out toward the whole ring. */
+ * Playback sits HEAR_LAG frames behind the newest sample, about 3.7 ms.
+ * A USB bundle is 4 blocks, about 0.6 ms, so the cushion can sit closer than
+ * it could when a bundle was 3.5 ms. The Digitone clock and the MPC clock
+ * are not the same, so the cushion slowly grows. Past HEAR_LAG + HEAR_NUDGE
+ * the read walks a hair faster (about one cent) until it is back. A real
+ * stall, further behind than HEAR_LAG * 2, still jumps forward. */
 #define HEAR_STEP ((48000u * 65536u) / 44100u)
-#define HEAR_LAG 256
+#define HEAR_LAG 176
+#define HEAR_NUDGE 40
 
 typedef struct {
     pthread_mutex_t lock;
     int runs;
-    int pair; /* source index on the connected device */
+    atomic_uint mix; /* one bit per switch; set bits are summed onto this track */
     int active;
-    int used; /* source marked for decode, or -1 */
+    uint32_t used; /* bits this copy has asked the reader to decode */
     uint32_t rpos, rfrac;
     int primed;
     int saw; /* this copy has played from the shared read */
+    int saw_source; /* an old project set SOURCE; switch defaults must not add Main on top */
+    int switches_live; /* host audio has started, so a switch move is the player, not a default */
     char v[TXT], dev[TXT], claim[TXT], rel[TXT], mid[TXT], logst[TXT];
 } probe_t;
 
@@ -111,6 +117,7 @@ static int g_instances;
 static atomic_int g_use[TB_MAX];
 static atomic_int g_lamp; /* 0 red, 1 amber, 2 green */
 static const tb_dev *g_dev; /* null until a session names the device; null means Digitone II */
+static atomic_uint g_rev; /* bumps when the connected machine changes, so switch names redraw */
 
 typedef struct { char *buf; size_t len; } plog_t;
 
@@ -186,6 +193,36 @@ static const char *src_name(int idx) {
     if (idx < 0) idx = 0;
     if (idx >= d->nsrc) idx = d->nsrc - 1;
     return d->src[idx].name;
+}
+
+/* Short label for one switch, from this machine's own output name.
+ * Digitone II (and Digitakt II, the same map) stays MAIN, 1–16, DLY, REV, CHO, IN.
+ * A switch this machine does not have is a blank. */
+static void src_tag(int idx, char *buf, int n) {
+    const tb_dev *d = tb_current();
+    const char *name;
+    int i;
+    if (!d || idx < 0 || idx >= d->nsrc || n < 2) {
+        if (n > 0) snprintf(buf, (size_t)n, " ");
+        return;
+    }
+    name = d->src[idx].name;
+    if (!strcmp(name, "main")) { snprintf(buf, (size_t)n, "MAIN"); return; }
+    if (!strncmp(name, "track ", 6)) { snprintf(buf, (size_t)n, "%s", name + 6); return; }
+    if (!strncmp(name, "synth track ", 12)) { snprintf(buf, (size_t)n, "S%s", name + 12); return; }
+    if (!strcmp(name, "delay")) { snprintf(buf, (size_t)n, "DLY"); return; }
+    if (!strcmp(name, "reverb")) { snprintf(buf, (size_t)n, "REV"); return; }
+    if (!strcmp(name, "chorus")) { snprintf(buf, (size_t)n, "CHO"); return; }
+    if (!strcmp(name, "input")) { snprintf(buf, (size_t)n, "IN"); return; }
+    if (!strcmp(name, "fx return")) { snprintf(buf, (size_t)n, "FX"); return; }
+    if (!strcmp(name, "analog fx")) { snprintf(buf, (size_t)n, "AFX"); return; }
+    if (!strcmp(name, "delay/reverb")) { snprintf(buf, (size_t)n, "D/R"); return; }
+    for (i = 0; name[i] && i < n - 1 && i < 6; i++) {
+        char c = name[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        buf[i] = c;
+    }
+    buf[i] = '\0';
 }
 
 /* Digitone II ranks above the other Overbridge machines, which rank above the
@@ -268,8 +305,8 @@ static void log_if_state(plog_t *L, const char *ifdir, const char *tag) {
 #define OP_FRAMES 7
 #define OP_HDR_MARK 0x0700
 #define OP_BURST 8
-#define OP_Q 2
-#define OP_BUNDLE 24
+#define OP_Q 8
+#define OP_BUNDLE 4
 #define OP_LISTEN_MS 1000
 #define OP_CHANS 14 /* main L/R plus tracks 1..6, each stereo, 4 bytes */
 /* One silent block towards the device: same 32 byte head, then 7 frames of 32 bytes. */
@@ -870,6 +907,7 @@ static void hear_status(const char *v, const char *dev, const char *claim, const
 static void *hear_thread(void *unused) {
     (void)unused;
     plog_t L = { malloc(LOG_CAP), 0 };
+    int failed = 1; /* the card log is only for a session that did not open */
     usbdev_t best = { 0 };
     int elektron = 0, fd = -1, let4 = 0, let5 = 0;
     int claimed = 0, if2_claimed = 0;
@@ -907,6 +945,7 @@ static void *hear_thread(void *unused) {
             goto save;
         }
         g_dev = D;
+        atomic_fetch_add_explicit(&g_rev, 1, memory_order_relaxed);
         pkt_in = tb_in_block(D);
         pkt_out = tb_out_block(D);
         out_len = OP_BUNDLE * pkt_out;
@@ -985,7 +1024,8 @@ static void *hear_thread(void *unused) {
         if (submit_urb(fd, &in_urb[q], 0x83, in_mem + (size_t)q * in_len, in_len) == 0) in_live[q] = 1;
     }
     hear_status("HEARING", NULL, "waiting", NULL, NULL);
-    plog(&L, "hearing: 24-block bundles, MIDI left on its driver");
+    plog(&L, "hearing: %d-block bundles, %d queued, MIDI left on its driver", OP_BUNDLE, OP_Q);
+    failed = 0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     last = t0;
     while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
@@ -993,9 +1033,10 @@ static void *hear_thread(void *unused) {
         struct timespec now;
         int live = 0;
         for (int q = 0; q < OP_Q; q++) live += in_live[q] + out_live[q];
-        if (!live) break;
+        if (!live) { failed = 1; plog(&L, "transfers stopped"); break; }
         if (ioctl(fd, USBDEVFS_REAPURBNDELAY, &done) < 0 || !done) {
             if (errno != EAGAIN) {
+                failed = 1;
                 plog(&L, "reap: %s (%d)", errname(errno), errno);
                 break;
             }
@@ -1078,14 +1119,14 @@ save:
         hear_status(NULL, NULL, NULL, midmsg, NULL);
         plog(&L, "-- after: if5 (MIDI) driver %s (was %s)", after, drv_before);
     }
-    if (L.buf) {
+    if (failed && L.buf) {
         int which = 0;
         char logst[TXT] = "NOT SAVED";
         if (save_log(L.buf, L.len, &which))
             snprintf(logst, sizeof logst, "%s", which == 0 ? "saved: EOS_DIGITAL" : "saved: /sdcard");
         hear_status(NULL, NULL, NULL, NULL, logst);
-        free(L.buf);
     }
+    free(L.buf);
     free(in_mem);
     free(out_mem);
 finish:
@@ -1105,20 +1146,44 @@ static void hear_join_locked(void) {
     atomic_store(&g_alive, 0);
 }
 
-static void use_drop(probe_t *P) {
-    int u = P->used;
-    if (u < 0 || u >= TB_MAX) { P->used = -1; return; }
-    atomic_fetch_sub_explicit(&g_use[u], 1, memory_order_relaxed);
-    P->used = -1;
+static void mix_label(uint32_t mask, char *buf, int n) {
+    int lim = src_lim();
+    int count = 0, pos = 0, fit = 1;
+    if (n < 2) return;
+    buf[0] = '\0';
+    for (int i = 0; i < lim; i++) {
+        const char *name;
+        int k;
+        if ((mask & (1u << i)) == 0) continue;
+        count++;
+        name = src_name(i);
+        k = (int)strlen(name);
+        if (pos + k + (pos ? 1 : 0) >= n) { fit = 0; break; }
+        if (pos) buf[pos++] = '+';
+        memcpy(buf + pos, name, (size_t)k);
+        pos += k;
+        buf[pos] = '\0';
+    }
+    if (!count) snprintf(buf, (size_t)n, "none");
+    else if (!fit) snprintf(buf, (size_t)n, "%d on", count);
 }
 
-static void use_take(probe_t *P) {
-    int s = P->pair;
-    if (s < 0 || s >= TB_MAX) s = 0;
-    if (P->used == s) return;
-    use_drop(P);
-    atomic_fetch_add_explicit(&g_use[s], 1, memory_order_relaxed);
-    P->used = s;
+/* Count only the switches that are on, and only while this copy is active.
+ * Turning one off drops that source if no other copy still wants it. */
+static void use_apply(probe_t *P) {
+    int lim = src_lim();
+    uint32_t want = P->active ? atomic_load_explicit(&P->mix, memory_order_relaxed) : 0;
+    uint32_t have = P->used;
+    if (lim < 32) want &= (1u << lim) - 1u;
+    for (int i = 0; i < TB_MAX; i++) {
+        uint32_t bit = 1u << i;
+        int had = (have & bit) != 0;
+        int need = (want & bit) != 0;
+        if (had == need) continue;
+        if (need) atomic_fetch_add_explicit(&g_use[i], 1, memory_order_relaxed);
+        else atomic_fetch_sub_explicit(&g_use[i], 1, memory_order_relaxed);
+    }
+    P->used = want;
 }
 
 /* ACTIVE on starts the shared read, or joins it if another copy already did.
@@ -1126,14 +1191,14 @@ static void use_take(probe_t *P) {
 static void hear_on(probe_t *P) {
     pthread_mutex_lock(&g_mu);
     P->active = 1;
-    use_take(P);
+    use_apply(P);
     if (atomic_load(&g_alive) && !atomic_load(&g_exited)) {
         P->primed = 0;
         P->saw = 1;
         if (!g_owner) g_owner = P;
         pthread_mutex_lock(&P->lock);
         snprintf(P->v, TXT, "HEARING");
-        snprintf(P->rel, TXT, "%s", src_name(P->pair));
+        mix_label(atomic_load_explicit(&P->mix, memory_order_relaxed), P->rel, TXT);
         pthread_mutex_unlock(&P->lock);
         pthread_mutex_unlock(&g_mu);
         return;
@@ -1149,12 +1214,12 @@ static void hear_on(probe_t *P) {
     P->rfrac = 0;
     pthread_mutex_lock(&P->lock);
     snprintf(P->v, TXT, "OPENING");
-    snprintf(P->rel, TXT, "%s", src_name(P->pair));
+    mix_label(atomic_load_explicit(&P->mix, memory_order_relaxed), P->rel, TXT);
     pthread_mutex_unlock(&P->lock);
     if (pthread_create(&g_th, NULL, hear_thread, NULL) != 0) {
         g_owner = NULL;
         P->active = 0;
-        use_drop(P);
+        use_apply(P);
         atomic_store_explicit(&g_lamp, 0, memory_order_relaxed);
         pthread_mutex_lock(&P->lock);
         snprintf(P->v, TXT, "OPEN FAILED");
@@ -1170,7 +1235,7 @@ static void hear_off(probe_t *P) {
     pthread_mutex_lock(&g_mu);
     int stop = atomic_load(&g_alive) && g_owner == P;
     P->active = 0;
-    use_drop(P);
+    use_apply(P);
     if (stop) hear_join_locked();
     pthread_mutex_lock(&P->lock);
     if (stop) snprintf(P->v, TXT, "STOPPED");
@@ -1592,7 +1657,7 @@ static void *create(const char *data_dir) {
     pthread_mutex_lock(&g_mu);
     g_instances++;
     pthread_mutex_unlock(&g_mu);
-    P->used = -1;
+    atomic_store_explicit(&P->mix, 1u, memory_order_relaxed); /* main, until a switch changes it */
     snprintf(P->v, TXT, "off");
     snprintf(P->dev, TXT, "-");
     snprintf(P->claim, TXT, "-");
@@ -1608,8 +1673,8 @@ static void destroy(void *inst) {
     probe_t *P = inst;
     int last;
     if (!P) return;
-    use_drop(P);
     P->active = 0;
+    use_apply(P);
     pthread_mutex_lock(&g_mu);
     if (g_instances > 0) g_instances--;
     last = g_instances <= 0;
@@ -1629,6 +1694,8 @@ static void destroy(void *inst) {
 
 static void midi(void *inst, const uint8_t *msg, int len) { (void)inst; (void)msg; (void)len; }
 
+static int switch_index(const char *key);
+
 static void set_param(void *inst, const char *key, const char *val) {
     probe_t *P = inst;
     if (!P || !key || !val) return;
@@ -1642,18 +1709,69 @@ static void set_param(void *inst, const char *key, const char *val) {
         int lim = src_lim();
         if (n < 0) n = 0;
         if (n >= lim) n = lim - 1;
+        atomic_store_explicit(&P->mix, 1u << n, memory_order_relaxed);
+        P->saw_source = 1;
         pthread_mutex_lock(&P->lock);
-        P->pair = n;
         snprintf(P->rel, TXT, "%s", src_name(n));
         pthread_mutex_unlock(&P->lock);
-        if (P->active) use_take(P);
+        if (P->active) use_apply(P);
+    } else {
+        int sw = switch_index(key);
+        if (sw >= 0) {
+            int on = atof(val) > 0.5;
+            /* s0 defaults on. The others default off. While a saved SOURCE is being
+             * restored, those defaults must not turn Main on or clear the saved output. */
+            int is_default = sw == 0 ? on : !on;
+            uint32_t m;
+            if (sw >= src_lim()) return;
+            if (P->saw_source && !P->switches_live && is_default) return;
+            m = atomic_load_explicit(&P->mix, memory_order_relaxed);
+            if (on) m |= 1u << sw;
+            else m &= ~(1u << sw);
+            atomic_store_explicit(&P->mix, m, memory_order_relaxed);
+            pthread_mutex_lock(&P->lock);
+            mix_label(m, P->rel, TXT);
+            pthread_mutex_unlock(&P->lock);
+            if (P->active) use_apply(P);
+        }
     }
+}
+
+static int switch_index(const char *key) {
+    int n = 0;
+    if (!key || key[0] != 's' || key[1] < '0' || key[1] > '9') return -1;
+    for (const char *p = key + 1; *p; p++) {
+        if (*p < '0' || *p > '9') return -1;
+        n = n * 10 + (*p - '0');
+        if (n >= TB_MAX) return -1;
+    }
+    return n;
+}
+
+static int named_switch(const char *key) {
+    char tmp[8];
+    const char *us = strrchr(key, '_');
+    size_t n;
+    if (!us || strcmp(us, "_name") != 0) return -1;
+    n = (size_t)(us - key);
+    if (n >= sizeof tmp) return -1;
+    memcpy(tmp, key, n);
+    tmp[n] = '\0';
+    return switch_index(tmp);
 }
 
 static int get_param(void *inst, const char *key, char *buf, int buf_len) {
     probe_t *P = inst;
     const char *src = NULL;
+    int named;
     if (!P || !key || !buf || buf_len < 2) return 0;
+    if (!strcmp(key, "display_rev"))
+        return snprintf(buf, buf_len, "%u", atomic_load_explicit(&g_rev, memory_order_relaxed));
+    named = named_switch(key);
+    if (named >= 0) {
+        src_tag(named, buf, buf_len);
+        return (int)strlen(buf);
+    }
     if (!strcmp(key, "p_v")) src = P->v;
     else if (!strcmp(key, "p_dev")) src = P->dev;
     else if (!strcmp(key, "p_claim")) src = P->claim;
@@ -1661,13 +1779,14 @@ static int get_param(void *inst, const char *key, char *buf, int buf_len) {
     else if (!strcmp(key, "p_mid")) src = P->mid;
     else if (!strcmp(key, "p_log")) src = P->logst;
     else if (!strcmp(key, "pair") || !strcmp(key, "source")) {
-        int idx;
-        pthread_mutex_lock(&P->lock);
-        idx = P->pair;
-        pthread_mutex_unlock(&P->lock);
-        if (idx < 0) idx = 0;
-        if (idx >= src_lim()) idx = src_lim() - 1;
+        uint32_t m = atomic_load_explicit(&P->mix, memory_order_relaxed);
+        int idx = 0, lim = src_lim();
+        for (int i = 0; i < lim; i++) if (m & (1u << i)) { idx = i; break; }
         return snprintf(buf, buf_len, "%d", idx);
+    } else if (switch_index(key) >= 0) {
+        int sw = switch_index(key);
+        uint32_t m = atomic_load_explicit(&P->mix, memory_order_relaxed);
+        return snprintf(buf, buf_len, "%d", (m & (1u << sw)) ? 1 : 0);
     } else if (!strcmp(key, "active")) {
         return snprintf(buf, buf_len, "%d", P->active ? 1 : 0);
     } else if (!strcmp(key, "lamp")) {
@@ -1676,11 +1795,8 @@ static int get_param(void *inst, const char *key, char *buf, int buf_len) {
         if (lamp > 2) lamp = 2;
         return snprintf(buf, buf_len, "%d", lamp);
     } else if (!strcmp(key, "srcname")) {
-        int idx;
-        pthread_mutex_lock(&P->lock);
-        idx = P->pair;
-        pthread_mutex_unlock(&P->lock);
-        return snprintf(buf, buf_len, "%s", src_name(idx));
+        uint32_t m = atomic_load_explicit(&P->mix, memory_order_relaxed);
+        return mix_label(m, buf, buf_len), (int)strlen(buf);
     }
     if (!src) return 0;
     pthread_mutex_lock(&P->lock);
@@ -1694,6 +1810,7 @@ static void render(void *inst, int16_t *out_lr, int frames) {
     if (!out_lr || frames < 1) return;
     memset(out_lr, 0, sizeof(int16_t) * 2 * (size_t)frames);
     if (!P) return;
+    P->switches_live = 1;
     if (!atomic_load_explicit(&g_alive, memory_order_acquire) ||
         atomic_load_explicit(&g_exited, memory_order_acquire)) {
         if (P->saw) {
@@ -1713,18 +1830,22 @@ static void render(void *inst, int16_t *out_lr, int frames) {
         pthread_mutex_unlock(&P->lock);
     }
     uint32_t w = atomic_load_explicit(&g_w, memory_order_acquire);
-    int pair = P->pair;
-    if (pair < 0 || pair >= src_lim()) pair = 0;
+    int lim = src_lim();
+    uint32_t mask = atomic_load_explicit(&P->mix, memory_order_relaxed);
+    if (lim < 32) mask &= (1u << lim) - 1u;
     if (!P->primed) {
         if (w < HEAR_LAG) return;
         P->primed = 1;
         P->rpos = w - HEAR_LAG;
         P->rfrac = 0;
     }
-    if ((uint32_t)(w - P->rpos) > HEAR_LAG * 4) {
+    if ((uint32_t)(w - P->rpos) > HEAR_LAG * 2) {
         P->rpos = w - HEAR_LAG;
         P->rfrac = 0;
     }
+    uint32_t step = HEAR_STEP;
+    if ((uint32_t)(w - P->rpos) > (uint32_t)HEAR_LAG + HEAR_NUDGE)
+        step += 32u;
     for (int i = 0; i < frames; i++) {
         if ((uint32_t)(w - P->rpos) < 2) {
             w = atomic_load_explicit(&g_w, memory_order_acquire);
@@ -1733,12 +1854,22 @@ static void render(void *inst, int16_t *out_lr, int frames) {
         int i0 = (int)(P->rpos & HEAR_MASK);
         int i1 = (int)((P->rpos + 1) & HEAR_MASK);
         int frac = (int)(P->rfrac >> 8);
-        for (int ch = 0; ch < 2; ch++) {
-            int a = g_ring[i0][pair * 2 + ch];
-            int b = g_ring[i1][pair * 2 + ch];
-            out_lr[i * 2 + ch] = (int16_t)(a + ((b - a) * frac) / 256);
+        int sum[2] = { 0, 0 };
+        for (int p = 0; p < lim; p++) {
+            if ((mask & (1u << p)) == 0) continue;
+            for (int ch = 0; ch < 2; ch++) {
+                int a = g_ring[i0][p * 2 + ch];
+                int b = g_ring[i1][p * 2 + ch];
+                sum[ch] += a + ((b - a) * frac) / 256;
+            }
         }
-        uint32_t acc = P->rfrac + HEAR_STEP;
+        for (int ch = 0; ch < 2; ch++) {
+            int v = sum[ch];
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            out_lr[i * 2 + ch] = (int16_t)v;
+        }
+        uint32_t acc = P->rfrac + step;
         P->rpos += acc >> 16;
         P->rfrac = acc & 0xffff;
     }

@@ -1,19 +1,19 @@
 # Tributary
 
-A small Overwitch rework for MPC standalone. It plays one Overbridge output from an Elektron Digitone II, over USB, on the MPC track the plugin sits on.
+A small Overwitch rework for MPC standalone. It plays Elektron Overbridge audio, over USB, on the MPC track the plugin sits on. One copy can sum several outputs. The Digitone II is the machine this has been heard on.
 
 [![Tributary demo](https://img.youtube.com/vi/QJIlWZKR8m0/hqdefault.jpg)](https://youtu.be/QJIlWZKR8m0)
 
 [Demo](https://youtu.be/QJIlWZKR8m0)
 
-Several copies can sit on several tracks. They share one USB read. Each copy plays one stereo pair, or one mono channel sent to both sides. Levels stay on the Digitone.
+Several copies can sit on several tracks. They share one USB read. Each copy sums the outputs whose switches are on. A mono output is sent to both sides. Levels stay on the Elektron machine.
 
 ## Caveats
 
-- There is a small amount of latency. Tributary plays from a few milliseconds behind the newest USB sample, so a late packet does not become a gap. That can leave the audio a little late against the MPC grid. The plugin cannot shift the other tracks to match. USB or DIN, and which machine is the clock, do not remove that wait. The spare is `HEAR_LAG` in `src/probe.c`.
+- There is a small amount of latency. On a Digitone II the plugin holds about 4 milliseconds of audio behind the newest USB sample, so a late packet does not become a gap. That can leave the audio a little late against the MPC grid. The plugin cannot shift the other tracks to match. USB or DIN, and which machine is the clock, do not remove that wait. The spare is `HEAR_LAG` in `src/probe.c`. The two clocks drift, so if the spare grows it is walked back without a skip.
 - Eight copies is the maximum in one project unless Hakai is installed. That is the MPC's own plugin limit.
 - Other Overbridge machines are listed and untested. Only the Digitone II has been heard. Testers are welcome. Analog Keys is not in this build. It uses the older Overbridge link, and Tributary only speaks the interrupt one.
-- You can only listen on the plugin track. The sound comes out of the track Tributary sits on. It is not a separate USB audio device, and one copy does not play every output at once.
+- You can only listen on the plugin track. The sound comes out of the track Tributary sits on. It is not a separate USB audio device. One copy sums the switches that are on.
 - Recording needs a resample. The sound is live USB audio, so a bounce does not capture it. Resample the track, or a submix, with the MPC sampler while it plays.
 - Use the MPC as the clock. Set the Digitone to follow MIDI clock and press play on the MPC. The Digitone can be the clock instead. Play and tempo do reach the MPC, and they wobble, because the clock shares the USB cable with the audio. The screen says **MPC is the clock** along the bottom for this reason.
 
@@ -30,15 +30,19 @@ The light is the session:
 - **Amber** means it is connecting.
 - **Green** means audio is coming in.
 
-**SOURCE** picks which output this copy plays. On a Digitone II that is main, tracks 1 to 16, delay, reverb, chorus, and the inputs. One click of the jog wheel or a Q-link moves one output. A finger on the knob jumps to the output it lands on.
+The switches are the outputs of the connected machine. On a Digitone II that grid is **MAIN**, **ACTIVE**, tracks **1** to **16**, **DLY**, **REV**, **CHO**, and **IN**. A Digitakt, Syntakt, or the other listed machines show their own output names on those switches. Switches the connected machine does not have stay blank.
 
-The rendered screen is `screenshots/tributary.png`. The artwork and the lamp frames live in `vst/art/`. The skin layout is `vst/layout.conf` and `vst/skin.css`.
+Turn a switch on to add that output to this track. Turn it off to take it out. The line above the switches names what is on. A fresh copy starts with **MAIN** on. Main already contains the tracks, so leave **MAIN** off when this copy should be one track on its own, or when several copies are splitting the machine across MPC tracks.
+
+An older project that saved a single source opens with only that output on.
+
+The rendered screen is `screenshots/tributary.png`. The artwork and the lamp frames live in `vst/art/`. The skin layout is `vst/layout.conf`.
 
 **ACTIVE** turns this copy on or off. The first copy to turn on opens the USB stream. Another copy just joins that stream. Turning **ACTIVE** off on the copy that opened it lets the Digitone go. Turning it off on another copy mutes that copy only.
 
 Take the plugin off the track when you are finished. The last copy releases the audio interfaces. The Digitone's MIDI interface is left on its driver the whole time, and loading Tributary wires the sequencer link between the Digitone and the MPC.
 
-The SOURCE list follows the connected device. Layouts for Digitakt, Digitakt II, Digitone, Digitone Keys, Syntakt, Analog Rytm MKII, Analog Four MKII, and Analog Heat (including MKII and +FX) are included from Overwitch's device list. They are untested.
+The switch names follow the connected device. Maps for Digitakt, Digitakt II, Digitone, Digitone Keys, Syntakt, Analog Rytm MKII, Analog Four MKII, and Analog Heat (including MKII and +FX) come from Overwitch's device list. They are untested. Digitakt II uses the same outputs as Digitone II.
 
 ## Install
 
@@ -61,9 +65,9 @@ These steps assume the same layout as Stream: plugin files in the Synths folder 
 
    A new line needs one MPC restart. Take any older Overprobe off the track, then insert Tributary.
 
-3. Plug the Digitone in before you start. Insert Tributary on a track, turn **ACTIVE** on, and pick a source. Use the MPC as the clock.
+3. Plug the Digitone in before you start. Insert Tributary on a track and turn **ACTIVE** on. Main is already on. Use the MPC as the clock.
 
-A log is appended to `/media/EOS_DIGITAL/tributary.log` (or `/sdcard/tributary.log` if that drive is missing).
+If a session cannot open, a log is written to `/media/EOS_DIGITAL/tributary.log` (or `/sdcard/tributary.log` if that drive is missing). The one-second check writes there too. A stream that is already hearing does not keep logging.
 
 ## Build
 
@@ -78,16 +82,16 @@ The plugin description is `vst/vst.json`. The engine is `src/probe.c` and `src/d
 
 You need Docker. Set `MPC_VST` to a checkout of mpc-vst-plugins. Both commands below use the same flags. The architecture is the compiler image.
 
-32-bit ARM, for `pluginList-arm` (the `v1.0.0` zip). `build_port.sh` runs this, and also draws the skin:
+32-bit ARM, for `pluginList-arm` (the `v1.1.0` zip). `build_port.sh` runs this, and also draws the skin:
 
 ```
 "$MPC_VST/tools/build_port.sh" "$PWD/vst/vst.json"
 ```
 
-The compile itself, with `arm32v7/gcc:12` (`--platform linux/arm/v7`, compiler `arm-linux-gnueabihf`):
+The compile itself matches `build_port.sh`: `arm32v7/gcc:11-bullseye` (`--platform linux/arm/v7`):
 
 ```
-docker run --rm --platform linux/arm/v7 -v "$PWD":/src -v "$MPC_VST":/mv:ro -w /src arm32v7/gcc:12 \
+docker run --rm --platform linux/arm/v7 -v "$PWD":/src -v "$MPC_VST":/mv:ro -w /src arm32v7/gcc:11-bullseye \
   gcc -O2 -Wall -Wextra -Wno-unused-parameter -fPIC -shared -fvisibility=hidden -std=gnu11 \
       -pthread -Ivst/build \
       src/probe.c /mv/wrapper/vst2_wrap.c \
@@ -95,10 +99,10 @@ docker run --rm --platform linux/arm/v7 -v "$PWD":/src -v "$MPC_VST":/mv:ro -w /
       -o vst/build/tributary.so
 ```
 
-AArch64, for `pluginList-arm-64bit` on a Gen2 MPC. Same flags, `arm64v8/gcc:12` (`--platform linux/arm64`, compiler `aarch64-linux-gnu`):
+AArch64, for `pluginList-arm-64bit` on a Gen2 MPC. Same flags, `arm64v8/gcc:12-bookworm` (`--platform linux/arm64`):
 
 ```
-docker run --rm --platform linux/arm64 -v "$PWD":/src -v "$MPC_VST":/mv:ro -w /src arm64v8/gcc:12 \
+docker run --rm --platform linux/arm64 -v "$PWD":/src -v "$MPC_VST":/mv:ro -w /src arm64v8/gcc:12-bookworm \
   gcc -O2 -Wall -Wextra -Wno-unused-parameter -fPIC -shared -fvisibility=hidden -std=gnu11 \
       -pthread -Ivst/build \
       src/probe.c /mv/wrapper/vst2_wrap.c \
@@ -112,7 +116,7 @@ Pack a zip (the `.so` stays out of git; it only goes in the zip):
 
 ```
 python3 tools/pack_release.py --so vst/build/tributary.so \
-  --skin "vst/build/skin/johnny - VST - Tributary" --arch armv7 --version 1.0.0
+  --skin "vst/build/skin/johnny - VST - Tributary" --arch armv7 --version 1.1.0
 ```
 
 `--arch aarch64` writes `pluginList-arm-64bit` instead of `pluginList-arm`.
@@ -125,7 +129,7 @@ sh test/run.sh
 
 ## Further development
 
-This is a first version that has been heard on one Digitone II. It would be good to see other people take it further: a shorter wait, other Overbridge machines, more than one output from a single copy.
+This has been heard on one Digitone II. It would be good to see other people take it further: a shorter wait, and the other Overbridge machines, which are listed and untested.
 
 ## Licence
 

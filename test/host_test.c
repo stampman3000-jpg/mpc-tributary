@@ -319,6 +319,20 @@ int main(void) {
         }
         check(main_peak > 1000 && delay_peak > 1000 && main_peak != delay_peak,
               "two copies play different pairs from the same blocks");
+        e->set_param(inst, "s0", "1");
+        e->set_param(inst, "s17", "1");
+        e->get_param(inst, "srcname", r[0], 64);
+        check(strstr(r[0], "main") && strstr(r[0], "delay"), "two switches name both sources");
+        e->render(inst, out, 128);
+        {
+            int mix_peak = 0;
+            for (i = 0; i < 256; i++) {
+                int a = out[i] < 0 ? -out[i] : out[i];
+                if (a > mix_peak) mix_peak = a;
+            }
+            check(mix_peak > main_peak && mix_peak > delay_peak,
+                  "two switches sum onto one track");
+        }
         e->set_param(other, "active", "0");
         check(atomic_load(&g_alive) == 1, "a follower turning ACTIVE off leaves the read running");
         e->destroy(other);
@@ -335,6 +349,45 @@ int main(void) {
             usleep(20000);
         }
         check(saw, "HEAR on an empty bus reports that no Digitone II was seen");
+    }
+
+    {
+        void *fresh = e->create(NULL);
+        int16_t silence[16];
+        const tb_dev *dt = tb_by_pid(0x0b2c);
+        const tb_dev *sy = tb_by_pid(0x0b4a);
+        memset(silence, 0, sizeof silence);
+        e->get_param(fresh, "s0", r[0], 64);
+        check(!strcmp(r[0], "1"), "a fresh copy starts with main on");
+        e->set_param(fresh, "source", "5");
+        e->set_param(fresh, "s0", "1");
+        e->set_param(fresh, "s5", "0");
+        e->get_param(fresh, "s0", r[0], 64);
+        e->get_param(fresh, "s5", r[1], 64);
+        e->get_param(fresh, "srcname", r[2], 64);
+        check(!strcmp(r[0], "0") && !strcmp(r[1], "1") && !strcmp(r[2], "track 5"),
+              "an old SOURCE restores only that output");
+        e->render(fresh, silence, 8);
+        e->set_param(fresh, "s0", "1");
+        e->get_param(fresh, "srcname", r[0], 64);
+        check(strstr(r[0], "main") && strstr(r[0], "track 5"),
+              "main can be added once the project is playing");
+        g_dev = dt;
+        e->get_param(fresh, "s0_name", r[0], 64);
+        e->get_param(fresh, "s9_name", r[1], 64);
+        e->get_param(fresh, "s10_name", r[2], 64);
+        check(dt && !strcmp(r[0], "MAIN") && !strcmp(r[1], "IN") && !strcmp(r[2], " "),
+              "Digitakt labels come from its own outputs");
+        g_dev = sy;
+        e->get_param(fresh, "s1_name", r[0], 64);
+        e->get_param(fresh, "s13_name", r[1], 64);
+        e->get_param(fresh, "s14_name", r[2], 64);
+        check(sy && !strcmp(r[0], "1") && !strcmp(r[1], "AFX") && !strcmp(r[2], "D/R"),
+              "Syntakt labels come from its own outputs");
+        g_dev = NULL;
+        e->get_param(fresh, "s17_name", r[0], 64);
+        check(!strcmp(r[0], "DLY"), "with no device the Digitone II labels stay");
+        e->destroy(fresh);
     }
 
     char buf[64] = "";

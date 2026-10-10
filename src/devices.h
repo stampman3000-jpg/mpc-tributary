@@ -4,10 +4,11 @@
  *
  * Offsets, sample sizes and channel names are facts taken from Overwitch's
  * device list (https://github.com/dagargo/overwitch, Copyright David García Goñi,
- * GPL-3). This is not Overwitch source. Digitone II is the only map that has
- * been heard on hardware. The others are here so a SOURCE knob can name them,
- * and they are marked untested. Analog Keys is omitted: Overwitch drives that
- * machine with the older isochronous link, which this plugin does not speak.
+ * GPL-3). This is not Overwitch source. The switch grid is built from this
+ * table, so each connected machine shows its own outputs. Digitone II is the
+ * only map that has been heard. Digitakt II shares that map. The others are
+ * untested. Analog Keys is omitted: Overwitch drives that machine with the
+ * older isochronous link, which this plugin does not speak.
  */
 #ifndef TRIBUTARY_DEVICES_H
 #define TRIBUTARY_DEVICES_H
