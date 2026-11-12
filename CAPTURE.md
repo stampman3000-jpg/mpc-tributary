@@ -10,13 +10,14 @@ Q-links come in fours. First page:
 
 1. **Bars** — 1, 2, 4, 8, or 16. It starts on 4.
 2. **Arm** — turn it on. The line says **Armed**. Nothing is written yet. When the MPC is playing, the take starts on the next bar.
-3. **Source** — **mix** records what you hear (the switches that are on). Any other choice records only that output. The switches you are listening to do not change.
-4. **Folder** — where the wav goes. The line under the status is the path, in words.
+3. **Folder** — where the wav goes. The line under the status is the full path. It starts on **card**.
 
-Second page:
+The take is whatever this copy of Tributary is already playing: the switches that are on, after the **Level** knob on the first page. There is no separate source knob.
 
-5. **Rearm** — after a take is saved, it arms again for the next bar.
-6. **Cancel** — drops the take. Nothing is written. If the file is already being saved, Cancel leaves it.
+Second page of the Q-links:
+
+4. **Rearm** — after a take is saved, it arms again for the next bar.
+5. **Cancel** — drops the take. Nothing is written. If the file is already being saved, Cancel leaves it.
 
 The status line is one of:
 
@@ -30,9 +31,9 @@ The status line is one of:
 
 | Folder knob | Path |
 |---|---|
-| plugin | `Tributary Captures` on the drive Tributary loaded from. On this MPC that is the SD card: `/media/EOS_DIGITAL/Tributary Captures` |
+| card | `Tributary Captures` on the same drive this copy of Tributary was loaded from. The card can have any name. The path line shows the full folder, and the folder is created when Tributary loads. This is the one to use. |
 | internal | `/storage/Tributary Captures` |
-| sd | `/media/EOS_DIGITAL/Tributary Captures` |
+| sd | the same card folder, if Tributary itself is on a card |
 | usb | `Tributary Captures` on another stick under `/media`, if one is plugged in |
 
 If that drive is not there, the path line says **not plugged in** and Arm will not start.
@@ -49,13 +50,13 @@ The open-mpc wrapper used to build Tributary only forwards the playhead, the tem
 
 The file starts **162 samples** after the bar line. That is the monitoring spare: 176 Digitone samples at 48 kHz, which is 162 samples at the MPC's 44.1 kHz, about 3.7 ms. The sound that belongs on the bar arrives that late. Starting the file then puts beat 1 at the start of the wav, in line with something you sequenced on the MPC. The spare itself is not changed. `HEAR_LAG` in `src/probe.c` is still 176.
 
-The length is the bars, at the tempo the take started at, at 44.1 kHz. 4 bars at 120 is 352800 samples. 1 bar at 120 is 88200.
+The length is the bars, at the tempo the take started at, at the Digitone's 48 kHz. 4 bars at 120 is 384000 samples, which is 8 seconds. The file is those samples as the Digitone sent them. It does not run them through the quick conversion the live track uses to fit the MPC's 44.1 kHz. That conversion is what made a take sound unlike the machine. The track you hear while it records is unchanged.
+
+The wav is **24-bit stereo, 48 kHz**. The Digitone's samples are 16-bit, so the extra 8 bits are empty. 24-bit is a size the MPC sampler already accepts.
 
 If the tempo changes during the take, or you hit stop, or the playhead jumps into the middle of a bar, the take is thrown away and the status says why. A jump back to the loop start is kept, so a take can cross the MPC loop. If the wrapper did not say where the loop is, a jump from one bar line back to an earlier bar line is treated as that loop. A jump that lands in the middle of a bar is thrown away.
 
-The longest take is **16 bars at 60 BPM** in 4/4. That is 64 seconds, 2822400 samples, about 11 MB while it is held and about 16 MB on disk. Slower than that, or a longer meter that would pass the cap, is refused so Arm does not grab a huge block of the MPC's memory. The memory is taken when you press Arm, not inside the audio block. The wav is written by a side thread after the last sample.
-
-The wav is **24-bit stereo, 44.1 kHz**. The live sound is 16-bit, so the extra 8 bits are empty. A float file would not be any more accurate, and 24-bit is what the MPC sampler loads without a fuss.
+The longest take that fits in the buffer is about 64 seconds. Arm grabs that memory, not the audio block. The wav is written by a side thread after the last sample.
 
 ## What the computer already checked
 

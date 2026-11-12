@@ -139,12 +139,29 @@ int main(void) {
         cap_path(c, path, sizeof path);
         check(!strcmp(path, "/media/EOS_DIGITAL/Tributary Captures"),
               "default folder is Tributary Captures on the plugin drive");
+        cap_destroy(c);
+        c = cap_create("/media/SOMECARD/synths/johnny - VST - Tributary/tributary.so");
+        cap_path(c, path, sizeof path);
+        check(!strcmp(path, "/media/SOMECARD/Tributary Captures"),
+              "a card with any name still gets Tributary Captures at its root");
         cap_set_dest(c, 1);
         cap_path(c, path, sizeof path);
         if (access("/storage", F_OK) == 0)
             check(!strcmp(path, "/storage/Tributary Captures"), "internal folder is on /storage");
         else
             check(!strcmp(path, "not plugged in"), "internal folder says so when /storage is absent");
+        cap_destroy(c);
+    }
+
+    {
+        cap_t *c = cap_create(NULL);
+        cap_path(c, path, sizeof path);
+        if (access("/media/EOS_DIGITAL", F_OK) == 0)
+            check(!strcmp(path, "/media/EOS_DIGITAL/Tributary Captures"),
+                  "no plugin path still uses the SD card");
+        else
+            check(!strcmp(path, "not plugged in"),
+                  "no plugin path and no SD says not plugged in");
         cap_destroy(c);
     }
 
@@ -293,6 +310,22 @@ int main(void) {
 
     {
         cap_t *c = fresh(dir, 0, 0);
+        FILE *f;
+        uint8_t hdr[44];
+        cap_set_rate(c, 48000);
+        cap_arm(c);
+        int st = run(c, 0.0, 120.0, 4, 4, -1, 0, 0, 0, 128, tone);
+        f = fopen(cap_last_file(c), "rb");
+        check(st == CAP_SAVED && f && fread(hdr, 1, 44, f) == 44
+              && hdr[24] == (48000 & 255) && hdr[25] == ((48000 >> 8) & 255)
+              && ((uint32_t)hdr[40] | ((uint32_t)hdr[41] << 8) | ((uint32_t)hdr[42] << 16)) / 6u == 96000u,
+              "a 48 kHz take is one bar of the Digitone rate, 96000 samples");
+        if (f) fclose(f);
+        cap_destroy(c);
+    }
+
+    {
+        cap_t *c = fresh(dir, 0, 0);
         double ppq = 0;
         cap_arm(c);
         for (int i = 0; i < 30; i++) {
@@ -323,6 +356,23 @@ int main(void) {
         feed(c, 2.0, 120.0, 4, 4, -1, 1, 0, 0, 0, 128, 128, tone);
         cap_status(c, status, sizeof status);
         check(!strcmp(status, "Error: transport moved"), "a jump in the middle of a bar throws the take away");
+        cap_destroy(c);
+        c = fresh(dir, 0, 0);
+        cap_arm(c);
+        {
+            double ppq = 0;
+            int k = 0;
+            int st = CAP_IDLE;
+            for (int n = 0; n < 2000; n++) {
+                st = cap_code(c);
+                if (st == CAP_SAVED || st == CAP_ERROR || st == CAP_CANCELLED) break;
+                double shown = ppq + (n ? 0.0009 : 0);
+                feed(c, shown, 120.0, 4, 4, -1, 1, 0, 0, 0, 128, k, tone);
+                k += 128;
+                ppq = step_ppq(ppq, 120.0, 128);
+            }
+            check(cap_wait(c, 4000) == CAP_SAVED, "the MPC's small position wobble does not throw the take away");
+        }
         cap_destroy(c);
     }
 

@@ -60,15 +60,21 @@ struct cap {
     char job_tag[8];
     char file[CAP_PATH];
     int job_bars;
+    int rate;
+    int job_rate;
 };
 
-long long cap_length_frames(int bars, int numer, int denom, double bpm) {
-    if (bars < 1 || numer < 1 || denom < 1 || !(bpm >= 1.0)) return 0;
-    double x = (double)bars * (double)numer * 4.0 * (double)CAP_SR * 60.0
+static long long length_at(int bars, int numer, int denom, double bpm, int rate) {
+    if (bars < 1 || numer < 1 || denom < 1 || rate < 8000 || !(bpm >= 1.0)) return 0;
+    double x = (double)bars * (double)numer * 4.0 * (double)rate * 60.0
                / ((double)denom * bpm);
     if (!(x >= 1.0)) return 0;
     if (x > (double)CAP_MAX_FRAMES + 1.0) return (long long)CAP_MAX_FRAMES + 1;
     return llround(x);
+}
+
+long long cap_length_frames(int bars, int numer, int denom, double bpm) {
+    return length_at(bars, numer, denom, bpm, CAP_SR);
 }
 
 static int bars_of(int index) {
@@ -112,15 +118,17 @@ static void join_path(char *out, size_t n, const char *root, const char *leaf) {
     else snprintf(out, n, "%s/%s", root, leaf);
 }
 
-/* USB sticks show up as other folders under /media. The SD card is EOS_DIGITAL. */
-static int find_usb(char *out, size_t n) {
+/* Another stick under /media, not the drive this plugin loaded from. */
+static int find_usb(const cap_t *c, char *out, size_t n) {
+    const char *skip = NULL;
+    if (c->drive[0] && strncmp(c->drive, "/media/", 7) == 0) skip = c->drive + 7;
     DIR *d = opendir("/media");
     if (!d) return -1;
     struct dirent *e;
     int found = 0;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
-        if (!strcmp(e->d_name, "EOS_DIGITAL")) continue;
+        if (skip && !strcmp(e->d_name, skip)) continue;
         char p[CAP_PATH];
         snprintf(p, sizeof p, "/media/%s", e->d_name);
         if (!dir_ok(p)) continue;
@@ -132,31 +140,77 @@ static int find_usb(char *out, size_t n) {
     return found ? 0 : -1;
 }
 
+/* A memory card can be named anything. Prefer one that already holds plugins. */
+static int media_root(char *out, size_t n) {
+    DIR *d = opendir("/media");
+    if (!d) return -1;
+    char any[CAP_PATH];
+    any[0] = '\0';
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char p[CAP_PATH];
+        snprintf(p, sizeof p, "/media/%s", e->d_name);
+        if (!dir_ok(p)) continue;
+        char sub[CAP_PATH];
+        join_path(sub, sizeof sub, p, "VST2 Plugins");
+        int plugins = dir_ok(sub);
+        join_path(sub, sizeof sub, p, "synths");
+        plugins = plugins || dir_ok(sub);
+        join_path(sub, sizeof sub, p, "Synths");
+        plugins = plugins || dir_ok(sub);
+        if (plugins) {
+            snprintf(out, n, "%s", p);
+            closedir(d);
+            return 0;
+        }
+        if (!any[0]) snprintf(any, sizeof any, "%s", p);
+    }
+    closedir(d);
+    if (!any[0]) return -1;
+    snprintf(out, n, "%s", any);
+    return 0;
+}
+
 static int resolve_dir(const cap_t *c, char *out, size_t n) {
     if (c->override[0]) {
         snprintf(out, n, "%s", c->override);
         return 0;
     }
     int dest = atomic_load_explicit(&c->dest, memory_order_relaxed);
-    if (dest <= 0) {
-        if (!c->drive[0]) return -1;
-        join_path(out, n, c->drive, "Tributary Captures");
-        return 0;
+    if (dest <= 0 || dest == 2) {
+        /* Same drive the plugin loaded from, whatever that card is called.
+         * "sd" is that drive too, unless the plugin itself is not on a card. */
+        if (c->drive[0] && (dest <= 0 || strncmp(c->drive, "/media/", 7) == 0)) {
+            join_path(out, n, c->drive, "Tributary Captures");
+            return 0;
+        }
+        char root[CAP_PATH];
+        if (media_root(root, sizeof root) == 0) {
+            join_path(out, n, root, "Tributary Captures");
+            return 0;
+        }
+        if (dest <= 0 && dir_ok("/storage")) {
+            snprintf(out, n, "/storage/Tributary Captures");
+            return 0;
+        }
+        return -1;
     }
     if (dest == 1) {
         if (!dir_ok("/storage")) return -1;
         snprintf(out, n, "/storage/Tributary Captures");
         return 0;
     }
-    if (dest == 2) {
-        if (!dir_ok("/media/EOS_DIGITAL")) return -1;
-        snprintf(out, n, "/media/EOS_DIGITAL/Tributary Captures");
-        return 0;
-    }
     char usb[CAP_PATH];
-    if (find_usb(usb, sizeof usb) != 0) return -1;
+    if (find_usb(c, usb, sizeof usb) != 0) return -1;
     join_path(out, n, usb, "Tributary Captures");
     return 0;
+}
+
+static void ensure_folder(cap_t *c) {
+    char dir[CAP_PATH];
+    if (resolve_dir(c, dir, sizeof dir) != 0) return;
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) return;
 }
 
 void cap_set_drive(cap_t *c, const char *data_dir) {
@@ -170,9 +224,11 @@ void cap_set_drive(cap_t *c, const char *data_dir) {
         char *sl = strrchr(c->drive, '/');
         if (!sl || sl == c->drive) break;
         const char *base = sl + 1;
-        int strip = !strcmp(base, "VST2 Plugins") || !strcmp(base, "Synths")
-                    || !strcmp(base, "synths") || strstr(base, " - VST - ")
-                    || strstr(base, " - MPC - ");
+        int strip = !strcmp(base, ".") || !strcmp(base, "VST2 Plugins")
+                    || !strcmp(base, "Synths") || !strcmp(base, "synths")
+                    || strstr(base, " - VST - ") || strstr(base, " - MPC - ");
+        size_t bl = strlen(base);
+        if (!strip && bl > 3 && !strcmp(base + bl - 3, ".so")) strip = 1;
         if (!strip) break;
         *sl = '\0';
     }
@@ -194,6 +250,12 @@ static void apply_tag(cap_t *c, const char *name) {
     else if (!strcmp(name, "Syntakt")) t = "ST";
     else if (strlen(name) <= 6 && !strchr(name, ' ')) t = name;
     snprintf(c->tag, sizeof c->tag, "%s", t);
+}
+
+void cap_set_rate(cap_t *c, int rate) {
+    if (!c || recording(c)) return;
+    if (rate < 8000) rate = CAP_SR;
+    c->rate = rate;
 }
 
 void cap_set_tag(cap_t *c, const char *device_name) {
@@ -312,8 +374,8 @@ static void *writer_main(void *arg) {
                     hdr[16] = 16;
                     hdr[20] = 1;
                     hdr[22] = 2;
-                    uint32_t rate = CAP_SR;
-                    uint32_t byterate = CAP_SR * 6u;
+                    uint32_t rate = c->job_rate >= 8000 ? (uint32_t)c->job_rate : (uint32_t)CAP_SR;
+                    uint32_t byterate = rate * 6u;
                     hdr[24] = (uint8_t)rate; hdr[25] = (uint8_t)(rate >> 8);
                     hdr[26] = (uint8_t)(rate >> 16); hdr[27] = (uint8_t)(rate >> 24);
                     hdr[28] = (uint8_t)byterate; hdr[29] = (uint8_t)(byterate >> 8);
@@ -383,6 +445,7 @@ int cap_arm(cap_t *c) {
         set_err(c, CAP_ERR_FOLDER);
         return -1;
     }
+    ensure_folder(c);
     if (!c->buf) {
         c->buf = malloc((size_t)CAP_MAX_FRAMES * 2u * sizeof(int16_t));
         if (!c->buf) {
@@ -431,7 +494,10 @@ cap_t *cap_create(const char *data_dir) {
     atomic_store_explicit(&c->latency, CAP_LATENCY_SAMPLES, memory_order_relaxed);
     atomic_store_explicit(&c->status, CAP_IDLE, memory_order_relaxed);
     apply_tag(c, "EL");
+    c->rate = CAP_SR;
+    c->job_rate = CAP_SR;
     cap_set_drive(c, data_dir);
+    ensure_folder(c);
     return c;
 }
 
@@ -506,7 +572,8 @@ static int begin_take(cap_t *c, const cap_time_t *t, int boundary) {
     int numer = t->numer >= 1 ? t->numer : 4;
     int denom = t->denom >= 1 ? t->denom : 4;
     int bars = atomic_load_explicit(&c->bars, memory_order_relaxed);
-    long long len = cap_length_frames(bars, numer, denom, t->bpm);
+    int rate = c->rate >= 8000 ? c->rate : CAP_SR;
+    long long len = length_at(bars, numer, denom, t->bpm, rate);
     if (len < 1 || len > CAP_MAX_FRAMES) {
         set_err(c, CAP_ERR_LONG);
         return 0;
@@ -516,10 +583,11 @@ static int begin_take(cap_t *c, const cap_time_t *t, int boundary) {
     c->lat_num = numer;
     c->lat_den = denom;
     c->job_bars = bars;
+    c->job_rate = rate;
     atomic_store_explicit(&c->show_bars, bars, memory_order_relaxed);
     atomic_store_explicit(&c->total, (unsigned)len, memory_order_relaxed);
     atomic_store_explicit(&c->bar_frames,
-                          (unsigned)cap_length_frames(1, numer, denom, t->bpm),
+                          (unsigned)length_at(1, numer, denom, t->bpm, rate),
                           memory_order_relaxed);
     atomic_store_explicit(&c->bpm_milli, (int)llround(t->bpm * 1000.0), memory_order_relaxed);
     atomic_store_explicit(&c->filled, 0, memory_order_relaxed);
@@ -570,8 +638,11 @@ void cap_transport(cap_t *c, const cap_time_t *t) {
         double expect = c->last_ppq + (double)c->last_frames * c->last_bpm
                         / (60.0 * (double)CAP_SR);
         double hop = t->ppq - expect;
-        double sample_ppq = t->bpm / (60.0 * (double)CAP_SR);
-        if (fabs(hop) > sample_ppq * 1.5) {
+        /* The MPC's playhead wanders by about a thousandth of a beat every
+         * block, and a tempo nudge can tug it back by a few hundredths.
+         * A step inside one beat is still this playhead. A bigger step is
+         * a real jump, unless the sequence just looped back to a bar. */
+        if (fabs(hop) > 1.0) {
             if (!is_wrap(c, t, hop)) {
                 if (mode == ST_ARMED) c->last_valid = 0;
                 else {
@@ -625,15 +696,41 @@ void cap_audio(cap_t *c, const int16_t *lr, int frames) {
     if (keep < 1 || skip >= frames) return;
     if (skip < 0) skip = 0;
     if (skip + keep > frames) keep = frames - skip;
+    cap_write(c, lr + (size_t)skip * 2, keep);
+}
+
+void cap_take_span(cap_t *c, int frames, int *skip, int *keep) {
+    if (skip) *skip = 0;
+    if (keep) *keep = 0;
+    if (!c || frames < 1) return;
+    if (atomic_load_explicit(&c->mode, memory_order_acquire) != ST_REC) return;
+    int s = c->skip;
+    int k = c->keep;
+    if (s < 0) s = 0;
+    if (k < 0) k = 0;
+    if (s >= frames) {
+        c->skip = s - frames;
+        return;
+    }
+    int use = frames - s;
+    if (use > k) use = k;
+    if (skip) *skip = s;
+    if (keep) *keep = use;
+    c->skip = 0;
+    c->keep = k - use;
+}
+
+void cap_write(cap_t *c, const int16_t *lr, int frames) {
+    if (!c || !lr || frames < 1) return;
+    if (atomic_load_explicit(&c->mode, memory_order_acquire) != ST_REC) return;
     uint32_t filled = atomic_load_explicit(&c->filled, memory_order_relaxed);
     uint32_t total = atomic_load_explicit(&c->total, memory_order_relaxed);
     if (filled >= total) return;
-    if (filled + (uint32_t)keep > total) keep = (int)(total - filled);
-    if (keep < 1 || !c->buf) return;
-    memcpy(c->buf + (size_t)filled * 2u, lr + (size_t)skip * 2u,
-           (size_t)keep * 2u * sizeof(int16_t));
-    filled += (uint32_t)keep;
-    c->rec_left -= keep;
+    if (filled + (uint32_t)frames > total) frames = (int)(total - filled);
+    if (frames < 1 || !c->buf) return;
+    memcpy(c->buf + (size_t)filled * 2u, lr, (size_t)frames * 2u * sizeof(int16_t));
+    filled += (uint32_t)frames;
+    c->rec_left -= frames;
     atomic_store_explicit(&c->filled, filled, memory_order_release);
     if (c->rec_left < 1 || filled >= total) {
         atomic_store_explicit(&c->mode, ST_SAVING, memory_order_release);

@@ -76,6 +76,12 @@ void cap_cancel(cap_t *c);
 /* Audio thread. No allocation, no file, no lock. */
 void cap_transport(cap_t *c, const cap_time_t *t);
 void cap_audio(cap_t *c, const int16_t *lr, int frames);
+/* The output samples of this block that belong in the take. Clears them
+ * so a later render in the same host block can take the rest. */
+void cap_take_span(cap_t *c, int frames, int *skip, int *keep);
+/* Append already-chosen samples. Used for the Digitone's own 48 kHz frames. */
+void cap_write(cap_t *c, const int16_t *lr, int frames);
+void cap_set_rate(cap_t *c, int rate);
 
 int cap_keep_count(const cap_t *c);
 int cap_source(const cap_t *c);

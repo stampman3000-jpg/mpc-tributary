@@ -110,8 +110,10 @@ typedef struct {
     int switches_live; /* host audio has started, so a switch move is the player, not a default */
     char v[TXT], dev[TXT], claim[TXT], rel[TXT], mid[TXT], logst[TXT];
     cap_t *cap;
-    int16_t *cap_tmp;
     int cap_arm_held;
+    atomic_int level; /* 0-100. 100 is the old full sum of the switches that are on. */
+    atomic_int meter; /* loudest sample of that sum, 0-32767, for the screen bar */
+    int meter_shown;
 } probe_t;
 
 /* One reader for the whole process. Instances only pick a pair. */
@@ -1693,11 +1695,12 @@ static void *create(const char *data_dir) {
     if (!P) return NULL;
     pthread_mutex_init(&P->lock, NULL);
     P->cap = cap_create(data_dir);
-    P->cap_tmp = calloc(512 * 2, sizeof(int16_t));
+    if (P->cap) cap_set_rate(P->cap, 48000);
     pthread_mutex_lock(&g_mu);
     g_instances++;
     pthread_mutex_unlock(&g_mu);
     atomic_store_explicit(&P->mix, 1u, memory_order_relaxed); /* main, until a switch changes it */
+    atomic_store_explicit(&P->level, 100, memory_order_relaxed);
     snprintf(P->v, TXT, "off");
     snprintf(P->dev, TXT, "-");
     snprintf(P->claim, TXT, "-");
@@ -1730,7 +1733,6 @@ static void destroy(void *inst) {
     }
     pthread_mutex_destroy(&P->lock);
     cap_destroy(P->cap);
-    free(P->cap_tmp);
     free(P);
 }
 
@@ -1746,6 +1748,11 @@ static void set_param(void *inst, const char *key, const char *val) {
     else if (!strcmp(key, "active")) {
         if (atof(val) > 0.5) hear_on(P);
         else hear_off(P);
+    } else if (!strcmp(key, "level")) {
+        int g = (int)(atof(val) + 0.5);
+        if (g < 0) g = 0;
+        if (g > 100) g = 100;
+        atomic_store_explicit(&P->level, g, memory_order_relaxed);
     } else if (!strcmp(key, "cap_len")) {
         if (P->cap) cap_set_len_index(P->cap, (int)atof(val));
     } else if (!strcmp(key, "cap_arm")) {
@@ -1861,6 +1868,13 @@ static int get_param(void *inst, const char *key, char *buf, int buf_len) {
     } else if (!strcmp(key, "srcname")) {
         uint32_t m = atomic_load_explicit(&P->mix, memory_order_relaxed);
         return mix_label(m, buf, buf_len), (int)strlen(buf);
+    } else if (!strcmp(key, "level")) {
+        return snprintf(buf, buf_len, "%d", atomic_load_explicit(&P->level, memory_order_relaxed));
+    } else if (!strcmp(key, "meter")) {
+        int m = atomic_load_explicit(&P->meter, memory_order_relaxed);
+        if (m < 0) m = 0;
+        if (m > 32767) m = 32767;
+        return snprintf(buf, buf_len, "%.4f", m / 32767.0);
     } else if (!strcmp(key, "cap_status")) {
         return P->cap ? cap_status(P->cap, buf, buf_len) : 0;
     } else if (!strcmp(key, "cap_path")) {
@@ -1885,46 +1899,51 @@ static int get_param(void *inst, const char *key, char *buf, int buf_len) {
     return n;
 }
 
-/* One output, read from the same spare the monitor just used.
- * This does not move the monitor's read pointer. */
-static void cap_one(int16_t *dst, int frames, uint32_t rp, uint32_t rf, uint32_t step, int pair) {
-    int16_t hold0 = 0, hold1 = 0;
-    for (int i = 0; i < frames; i++) {
-        uint32_t w = atomic_load_explicit(&g_w, memory_order_acquire);
-        if ((uint32_t)(w - rp) < 2) {
-            dst[i * 2] = hold0;
-            dst[i * 2 + 1] = hold1;
-            continue;
+/* The bar follows the mix you hear. It falls on its own, and the screen
+ * only redraws when the shown step actually moves. */
+static void note_meter(probe_t *P, const int16_t *lr, int frames) {
+    int peak = 0;
+    if (lr && frames > 0) {
+        int n = frames * 2;
+        for (int i = 0; i < n; i++) {
+            int a = lr[i];
+            if (a < 0) a = -a;
+            if (a > peak) peak = a;
         }
-        int i0 = (int)(rp & HEAR_MASK);
-        int i1 = (int)((rp + 1) & HEAR_MASK);
-        int frac = (int)(rf >> 8);
-        for (int ch = 0; ch < 2; ch++) {
-            int a = g_ring[i0][pair * 2 + ch];
-            int b = g_ring[i1][pair * 2 + ch];
-            int v = a + ((b - a) * frac) / 256;
-            if (v > 32767) v = 32767;
-            if (v < -32768) v = -32768;
-            dst[i * 2 + ch] = (int16_t)v;
-            if (ch == 0) hold0 = (int16_t)v;
-            else hold1 = (int16_t)v;
-        }
-        uint32_t acc = rf + step;
-        rp += acc >> 16;
-        rf = acc & 0xffff;
+    }
+    int held = atomic_load_explicit(&P->meter, memory_order_relaxed);
+    int next = peak > held ? peak : held - (held >> 4);
+    if (next < 0) next = 0;
+    atomic_store_explicit(&P->meter, next, memory_order_relaxed);
+    int shown = next >= 32767 ? 100 : (next * 100) / 32767;
+    if (shown != P->meter_shown) {
+        P->meter_shown = shown;
+        atomic_fetch_add_explicit(&g_rev, 1, memory_order_relaxed);
     }
 }
 
 static void cap_push(probe_t *P, const int16_t *out_lr, int frames,
                      int walked, uint32_t rp, uint32_t rf, uint32_t step) {
-    if (!P || !P->cap) return;
-    int src = cap_source(P->cap);
-    if (walked && cap_keep_count(P->cap) > 0 && src > 0 && P->cap_tmp && frames > 0 && frames <= 512) {
-        cap_one(P->cap_tmp, frames, rp, rf, step, src - 1);
-        cap_audio(P->cap, P->cap_tmp, frames);
-        return;
+    (void)walked; (void)rp; (void)rf; (void)step;
+    if (!P) return;
+    note_meter(P, out_lr, frames);
+}
+
+/* One Digitone frame, the switches that are on, no interpolation. */
+static void mix_source(uint32_t rp, uint32_t mask, int lim, int gain, int16_t *dst) {
+    int sum[2] = { 0, 0 };
+    int i0 = (int)(rp & HEAR_MASK);
+    for (int p = 0; p < lim; p++) {
+        if ((mask & (1u << p)) == 0) continue;
+        sum[0] += g_ring[i0][p * 2];
+        sum[1] += g_ring[i0][p * 2 + 1];
     }
-    if (out_lr) cap_audio(P->cap, out_lr, frames);
+    for (int ch = 0; ch < 2; ch++) {
+        int v = sum[ch] * gain / 100;
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        dst[ch] = (int16_t)v;
+    }
 }
 
 static void render(void *inst, int16_t *out_lr, int frames) {
@@ -1978,11 +1997,15 @@ static void render(void *inst, int16_t *out_lr, int frames) {
         uint32_t behind = (uint32_t)(w - P->rpos);
         uint32_t step = HEAR_STEP;
         uint32_t cap_rp = P->rpos, cap_rf = P->rfrac;
+        int cap_skip = 0, cap_keep = 0;
+        int gain = atomic_load_explicit(&P->level, memory_order_relaxed);
+        if (P->cap) cap_take_span(P->cap, frames, &cap_skip, &cap_keep);
         if (behind > (uint32_t)HEAR_LAG + (uint32_t)HEAR_NUDGE)
             step += 32u;
         else if (behind < (uint32_t)HEAR_LAG - (uint32_t)HEAR_NUDGE)
             step -= 32u;
         for (int i = 0; i < frames; i++) {
+            uint32_t rp_before = P->rpos;
             if ((uint32_t)(w - P->rpos) < 2) {
                 w = atomic_load_explicit(&g_w, memory_order_acquire);
                 if ((uint32_t)(w - P->rpos) < 2) {
@@ -2004,7 +2027,7 @@ static void render(void *inst, int16_t *out_lr, int frames) {
                 }
             }
             for (int ch = 0; ch < 2; ch++) {
-                int v = sum[ch];
+                int v = sum[ch] * gain / 100;
                 if (v > 32767) v = 32767;
                 if (v < -32768) v = -32768;
                 out_lr[i * 2 + ch] = (int16_t)v;
@@ -2013,7 +2036,20 @@ static void render(void *inst, int16_t *out_lr, int frames) {
             uint32_t acc = P->rfrac + step;
             P->rpos += acc >> 16;
             P->rfrac = acc & 0xffff;
+            /* The file keeps the Digitone frames themselves. The 44.1 walk
+             * above is only what this track plays. */
+            if (cap_keep > 0 && i >= cap_skip && i < cap_skip + cap_keep) {
+                uint32_t nsrc = P->rpos - rp_before;
+                if (nsrc > 4) nsrc = 4;
+                if (nsrc > 0) {
+                    int16_t tmp[8];
+                    for (uint32_t k = 0; k < nsrc; k++)
+                        mix_source(rp_before + k, mask, lim, gain, tmp + (int)k * 2);
+                    cap_write(P->cap, tmp, (int)nsrc);
+                }
+            }
         }
+        (void)cap_rp; (void)cap_rf;
         cap_push(P, out_lr, frames, 1, cap_rp, cap_rf, step);
     }
 }

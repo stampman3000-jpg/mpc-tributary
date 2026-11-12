@@ -28,10 +28,18 @@
     {"key": "cap_len", "name": "Bars", "min": 0, "max": 4, "default": 2, "options": ["1", "2", "4", "8", "16"]},
     {"key": "cap_arm", "name": "Arm", "min": 0, "max": 1, "default": 0},
     {"key": "cap_src", "name": "Source", "min": 0, "max": 21, "default": 0, "options": ["mix", "main", "track 1", "track 2", "track 3", "track 4", "track 5", "track 6", "track 7", "track 8", "track 9", "track 10", "track 11", "track 12", "track 13", "track 14", "track 15", "track 16", "delay", "reverb", "chorus", "input"]},
-    {"key": "cap_dest", "name": "Folder", "min": 0, "max": 3, "default": 0, "options": ["plugin", "internal", "sd", "usb"]},
+    {"key": "cap_dest", "name": "Folder", "min": 0, "max": 3, "default": 0, "options": ["card", "internal", "sd", "usb"]},
     {"key": "cap_auto", "name": "Rearm", "min": 0, "max": 1, "default": 0},
     {"key": "cap_cancel", "name": "Cancel", "min": 0, "max": 1, "default": 0},
     {"key": "cap_status", "name": "Status", "min": 0, "max": 1, "default": 0, "display": "string"},
-    {"key": "cap_path", "name": "Path", "min": 0, "max": 1, "default": 0, "display": "string"}
+    {"key": "cap_path", "name": "Path", "min": 0, "max": 1, "default": 0, "display": "string"},
+    {"key": "cap_len_prev", "name": "Bars Prev", "momentary": true, "step_of": "cap_len", "step_delta": -1, "debounce_ms": 0},
+    {"key": "cap_len_next", "name": "Bars Next", "momentary": true, "step_of": "cap_len", "step_delta": 1, "debounce_ms": 0},
+    {"key": "cap_src_prev", "name": "Source Prev", "momentary": true, "step_of": "cap_src", "step_delta": -1, "debounce_ms": 0},
+    {"key": "cap_src_next", "name": "Source Next", "momentary": true, "step_of": "cap_src", "step_delta": 1, "debounce_ms": 0},
+    {"key": "cap_dest_prev", "name": "Folder Prev", "momentary": true, "step_of": "cap_dest", "step_delta": -1, "debounce_ms": 0},
+    {"key": "cap_dest_next", "name": "Folder Next", "momentary": true, "step_of": "cap_dest", "step_delta": 1, "debounce_ms": 0},
+    {"key": "level", "name": "Level", "min": 0, "max": 100, "default": 100, "display": "int"},
+    {"key": "meter", "name": "Meter", "min": 0, "max": 1, "default": 0}
   ]
 }

@@ -14,7 +14,7 @@ Several copies can sit on several tracks. They share one USB read. Each copy sum
 - Eight copies is the maximum in one project unless Hakai is installed. That is the MPC's own plugin limit.
 - Other Overbridge machines are listed and untested. Only the Digitone II has been heard. Testers are welcome. Analog Rytm MKI, Analog Four MKI and Analog Keys are unsupported, same as Overwitch. They use the older Overbridge 1 link, and Tributary only speaks the interrupt one.
 - You can only listen on the plugin track. The sound comes out of the track Tributary sits on. It is not a separate USB audio device. One copy sums the switches that are on.
-- Recording needs a resample, or the Capture tab. The sound is live USB audio, so a bounce does not capture it. Resample the track, or open Capture and record a bar-locked wav. See `CAPTURE.md`.
+- Recording. A project bounce does not grab this USB audio. The track you hear is resampled: the machine is 48 kHz and the MPC track is 44.1, so Tributary converts it to stay in time. Capture writes a different file, the machine's own 48 kHz samples for the switches that are on, locked to a whole number of bars. You can still resample the track if you want exactly what the track played. See `CAPTURE.md`.
 - Use the MPC as the clock. Set the Digitone to follow MIDI clock and press play on the MPC. The Digitone can be the clock instead. Play and tempo do reach the MPC, and they wobble, because the clock shares the USB cable with the audio. The screen says **MPC is the clock** along the bottom for this reason.
 
 ## What you need

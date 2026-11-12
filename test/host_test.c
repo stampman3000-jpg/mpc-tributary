@@ -495,6 +495,10 @@ int main(void) {
         e->render(b, ob, 32);
         for (i = 0; i < 64; i++) if (oa[i] != ob[i]) same = 0;
         check(same && oa[0] == 7000 && oa[1] == -7000, "arming capture does not change the monitored audio");
+        e->set_param(a, "level", "50");
+        e->render(a, oa, 32);
+        check(oa[0] == 3500 && oa[1] == -3500, "level 50 is half of this copy's mix");
+        e->set_param(a, "level", "100");
         e->set_param(b, "cap_cancel", "1");
         e->get_param(b, "cap_status", st, 64);
         check(!strcmp(st, "Cancelled"), "cancel drops the take");
