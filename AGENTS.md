@@ -49,6 +49,8 @@ Catalogue releases go through the mpc-vst-plugins checkout. `tools/release.py` t
 
 Repeat `release.py` for the AArch64 `.so` when that zip belongs on the same release. The catalogue reads `*-mpc-armv7.zip` unless the entry says otherwise. Attach the zips to a GitHub release of this repo. Keep the uid `54726962` and the file name `tributary.so` fixed across versions.
 
+**Never replace or delete a published release zip.** GitHub keeps the download count on the file itself, and the catalogue's headline number is the sum over every 32-bit zip still on the releases. Deleting or re-uploading a zip throws its count away for good (1.1.0 lost 620 downloads this way on 12 Nov 2026), and re-uploading the same zip makes a new file at 0. Any change to what's in a zip, even a fix, gets a new version number (e.g. 1.1.1) and a new release beside the old one. Leave old releases and their zips where they are. One 32-bit zip per release, or the catalogue rejects it.
+
 `tools/pack_release.py` in this repo is the hand packer the README describes. It does not write `mpc-plugin.json`. A release that should be listed uses `release.py` and `catalog_check.py`.
 
 ## Catalogue
@@ -66,4 +68,5 @@ Catalogue pull requests go from the stampman3000-jpg fork to sd88me/mpc-vst-plug
 - Catalogue pull requests go from the stampman3000-jpg fork to sd88me/mpc-vst-plugins.
 - Keep the licence GPL-3.0-only. Keep the Overwitch credit to David García Goñi (dagargo). The sample decode keeps its Stefan Rehm and David García Goñi credit too.
 - This is a public repository. Do not add a home address, a personal email, or private files. Git commits are `Stampman3000 <stampman3000@gmail.com>`.
+- Never delete, replace or re-upload a published release zip. Fixes ship as a new version beside the old release, so download counts and "it works" ticks are kept.
 - Do not rewrite history. No force-push, and no rebase or amend of commits that are already on the remote.
