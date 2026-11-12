@@ -339,6 +339,81 @@ int main(void) {
         check(atomic_load(&g_alive) == 1, "removing one copy leaves the shared read running");
         atomic_store(&g_alive, 0);
     }
+    {
+        /* A rising ramp stands in for the body of a kick: smooth, so a skip is obvious. */
+        void *kick = e->create(NULL);
+        probe_t *K = kick;
+        int16_t out[128];
+        int i, before, across = 0, max_step = 0;
+        for (i = 0; i < 6000; i++) {
+            int16_t s = (int16_t)(4000 + i);
+            g_ring[i & HEAR_MASK][0] = s;
+            g_ring[i & HEAR_MASK][1] = s;
+        }
+        atomic_store(&g_exited, 0);
+        atomic_store(&g_alive, 1);
+        atomic_store(&g_w, 3000);
+        e->set_param(kick, "active", "1");
+        e->render(kick, out, 16);
+        before = out[30];
+        /* Fatter than the old 7 ms jump, and not a stall. */
+        atomic_store(&g_w, K->rpos + (uint32_t)HEAR_LAG * 2u + 80u);
+        e->render(kick, out, 64);
+        across = out[0] - before;
+        if (across < 0) across = -across;
+        for (i = 2; i < 128; i += 2) {
+            int d = out[i] - out[i - 2];
+            if (d < 0) d = -d;
+            if (d > max_step) max_step = d;
+        }
+        check(across <= 2 && max_step <= 2,
+              "a fat spare is walked, not jumped, so a low kick is not cut");
+        for (i = 0; i < 32; i++) {
+            g_ring[(K->rpos + (uint32_t)i) & HEAR_MASK][0] = 18000;
+            g_ring[(K->rpos + (uint32_t)i) & HEAR_MASK][1] = 18000;
+        }
+        atomic_store(&g_w, K->rpos + 3);
+        e->render(kick, out, 32);
+        {
+            int held = 1;
+            for (i = 0; i < 64; i++) if (out[i] < 16000) held = 0;
+            check(held, "a late packet holds the last sample instead of dropping to silence");
+        }
+        e->destroy(kick);
+        atomic_store(&g_alive, 0);
+    }
+    {
+        unsigned char pkt[OP_PKT_BYTES];
+        uint32_t w0, w1;
+        int f;
+        memset(pkt, 0, sizeof pkt);
+        pkt[0] = 0x07;
+        pkt[3] = 7;
+        for (f = 0; f < OP_FRAMES; f++) pkt[32 + f * OP_FRAME_BYTES + 1] = 0x10;
+        g_dev = NULL;
+        g_ctr_set = 0;
+        for (f = 0; f < TB_MAX; f++) atomic_store(&g_use[f], 0);
+        atomic_store(&g_use[0], 1);
+        atomic_store(&g_w, 0);
+        push_frames(pkt);
+        w0 = atomic_load(&g_w);
+        pkt[3] = 14;
+        for (f = 0; f < OP_FRAMES; f++) pkt[32 + f * OP_FRAME_BYTES + 1] = 0x20;
+        push_frames(pkt);
+        w1 = atomic_load(&g_w);
+        check(w1 == w0 + (uint32_t)OP_FRAMES && g_ring[w0][0] != g_ring[0][0],
+              "the next block, counter +7, is written as itself");
+        pkt[3] = 28; /* previous counter was 14, so this one skipped a block */
+        for (f = 0; f < OP_FRAMES; f++) pkt[32 + f * OP_FRAME_BYTES + 1] = 0x30;
+        push_frames(pkt);
+        check(atomic_load(&g_w) == w1 + (uint32_t)OP_FRAMES * 2,
+              "a missed block is filled before the next one");
+        check(g_ring[w1][0] == g_ring[w1 - 1][0], "the fill repeats the last sample");
+        check(g_ring[w1 + OP_FRAMES][0] != g_ring[w1][0], "the late block follows the fill");
+        g_ctr_set = 0;
+        atomic_store(&g_lamp, 0);
+        for (f = 0; f < TB_MAX; f++) atomic_store(&g_use[f], 0);
+    }
     reset_fixture();
     e->set_param(inst, "hear", "1");
     {

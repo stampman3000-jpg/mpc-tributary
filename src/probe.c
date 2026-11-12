@@ -81,14 +81,18 @@ static int repair_seq_link(void);
 /* Digitone is 48 kHz. The MPC asks for 44.1 kHz. This step walks the Digitone
  * stream at that ratio: one MPC sample takes a bit more than one Digitone sample.
  * Playback sits HEAR_LAG frames behind the newest sample, about 3.7 ms.
- * A USB bundle is 4 blocks, about 0.6 ms, so the cushion can sit closer than
- * it could when a bundle was 3.5 ms. The Digitone clock and the MPC clock
- * are not the same, so the cushion slowly grows. Past HEAR_LAG + HEAR_NUDGE
- * the read walks a hair faster (about one cent) until it is back. A real
- * stall, further behind than HEAR_LAG * 2, still jumps forward. */
+ * A USB bundle is 4 blocks, about 0.6 ms. The two clocks are not the same, so
+ * the spare drifts. Past HEAR_LAG + HEAR_NUDGE the read walks a hair faster
+ * (about one cent). Under HEAR_LAG - HEAR_NUDGE it walks a hair slower, so a
+ * thin spare can refill. A kick is a smooth loud wave, and a skip or a drop
+ * to silence is a tick in it. A packet that is later than the spare repeats
+ * the last sample for that moment. The read jumps forward only after a real
+ * stall, half the ring, about 170 ms. Jumping any sooner is the tick. */
 #define HEAR_STEP ((48000u * 65536u) / 44100u)
 #define HEAR_LAG 176
 #define HEAR_NUDGE 40
+_Static_assert(HEAR_LAG > HEAR_NUDGE, "the spare has to be deeper than the walk band");
+_Static_assert(HEAR_CAP / 2 > HEAR_LAG * 2, "a stall is longer than a short spare");
 
 typedef struct {
     pthread_mutex_t lock;
@@ -97,6 +101,7 @@ typedef struct {
     int active;
     uint32_t used; /* bits this copy has asked the reader to decode */
     uint32_t rpos, rfrac;
+    int16_t hold[2]; /* last sample sent out; a dry moment repeats it */
     int primed;
     int saw; /* this copy has played from the shared read */
     int saw_source; /* an old project set SOURCE; switch defaults must not add Main on top */
@@ -107,6 +112,11 @@ typedef struct {
 /* One reader for the whole process. Instances only pick a pair. */
 static int16_t g_ring[HEAR_CAP][HEAR_PAIRS * 2];
 static atomic_uint g_w;
+/* Last decoded frame, and the block counter it belonged to. A hole in the
+ * counter is filled with that frame so the next block is not spliced on. */
+static int g_ctr_set;
+static uint16_t g_ctr;
+static int16_t g_hold_frame[HEAR_PAIRS * 2];
 static atomic_int g_stop;
 static atomic_int g_exited;
 static atomic_int g_alive;
@@ -858,18 +868,34 @@ static int save_log(const char *buf, size_t len, int *which) {
     return 0;
 }
 
+static void ring_write(const int16_t *frame) {
+    uint32_t w = atomic_load_explicit(&g_w, memory_order_relaxed);
+    memcpy(g_ring[w & HEAR_MASK], frame, sizeof g_hold_frame);
+    atomic_store_explicit(&g_w, w + 1, memory_order_release);
+}
+
 /* Decode only sources an open copy is playing. A mono source is written to
- * both sides so it is not stuck on the left. Unused slots are cleared. */
+ * both sides so it is not stuck on the left. Unused slots are cleared.
+ * The block counter rises by 7. A short hole repeats the last frame, so a
+ * missing block is not spliced into the kick. A long hole is a stall, and
+ * the read deals with that. Eight blocks is about a millisecond. */
 static void push_frames(const unsigned char *pkt) {
     const tb_dev *D = tb_current();
     int frame = D ? D->frame : OP_FRAME_BYTES;
     int nsrc = D ? D->nsrc : 0;
+    uint16_t ctr = load_be16(pkt + 2);
+    int16_t one[HEAR_PAIRS * 2];
     if (nsrc > TB_MAX) nsrc = TB_MAX;
+    if (g_ctr_set) {
+        unsigned gap = (uint16_t)(ctr - g_ctr);
+        if (gap > 7 && gap <= 7u * 8u) {
+            int hole = (int)gap - 7;
+            for (int n = 0; n < hole; n++) ring_write(g_hold_frame);
+        }
+    }
     for (int f = 0; f < OP_FRAMES; f++) {
         const unsigned char *fr = pkt + 32 + (size_t)f * (size_t)frame;
-        uint32_t w = atomic_load_explicit(&g_w, memory_order_relaxed);
-        int16_t *dst = g_ring[w & HEAR_MASK];
-        memset(dst, 0, sizeof(int16_t) * (size_t)(HEAR_PAIRS * 2));
+        memset(one, 0, sizeof one);
         for (int p = 0; p < nsrc; p++) {
             if (atomic_load_explicit(&g_use[p], memory_order_relaxed) <= 0) continue;
             const tb_src *s = &D->src[p];
@@ -878,11 +904,14 @@ static void push_frames(const unsigned char *pkt) {
             int16_t R = L;
             if (s->stereo)
                 R = s->bytes == 4 ? ob_i16(b + 4) : ob_i16_3(b + 3);
-            dst[p * 2] = L;
-            dst[p * 2 + 1] = R;
+            one[p * 2] = L;
+            one[p * 2 + 1] = R;
         }
-        atomic_store_explicit(&g_w, w + 1, memory_order_release);
+        ring_write(one);
     }
+    memcpy(g_hold_frame, one, sizeof g_hold_frame);
+    g_ctr = ctr;
+    g_ctr_set = 1;
     atomic_store_explicit(&g_lamp, 2, memory_order_relaxed);
 }
 
@@ -1206,6 +1235,7 @@ static void hear_on(probe_t *P) {
     if (atomic_load(&g_alive)) hear_join_locked();
     g_owner = P;
     atomic_store(&g_w, 0);
+    g_ctr_set = 0;
     atomic_store(&g_stop, 0);
     atomic_store(&g_exited, 0);
     atomic_store_explicit(&g_lamp, 1, memory_order_relaxed);
@@ -1838,40 +1868,52 @@ static void render(void *inst, int16_t *out_lr, int frames) {
         P->primed = 1;
         P->rpos = w - HEAR_LAG;
         P->rfrac = 0;
+        P->hold[0] = 0;
+        P->hold[1] = 0;
     }
-    if ((uint32_t)(w - P->rpos) > HEAR_LAG * 2) {
+    if ((uint32_t)(w - P->rpos) > (uint32_t)(HEAR_CAP / 2)) {
         P->rpos = w - HEAR_LAG;
         P->rfrac = 0;
     }
-    uint32_t step = HEAR_STEP;
-    if ((uint32_t)(w - P->rpos) > (uint32_t)HEAR_LAG + HEAR_NUDGE)
-        step += 32u;
-    for (int i = 0; i < frames; i++) {
-        if ((uint32_t)(w - P->rpos) < 2) {
-            w = atomic_load_explicit(&g_w, memory_order_acquire);
-            if ((uint32_t)(w - P->rpos) < 2) break;
-        }
-        int i0 = (int)(P->rpos & HEAR_MASK);
-        int i1 = (int)((P->rpos + 1) & HEAR_MASK);
-        int frac = (int)(P->rfrac >> 8);
-        int sum[2] = { 0, 0 };
-        for (int p = 0; p < lim; p++) {
-            if ((mask & (1u << p)) == 0) continue;
-            for (int ch = 0; ch < 2; ch++) {
-                int a = g_ring[i0][p * 2 + ch];
-                int b = g_ring[i1][p * 2 + ch];
-                sum[ch] += a + ((b - a) * frac) / 256;
+    {
+        uint32_t behind = (uint32_t)(w - P->rpos);
+        uint32_t step = HEAR_STEP;
+        if (behind > (uint32_t)HEAR_LAG + (uint32_t)HEAR_NUDGE)
+            step += 32u;
+        else if (behind < (uint32_t)HEAR_LAG - (uint32_t)HEAR_NUDGE)
+            step -= 32u;
+        for (int i = 0; i < frames; i++) {
+            if ((uint32_t)(w - P->rpos) < 2) {
+                w = atomic_load_explicit(&g_w, memory_order_acquire);
+                if ((uint32_t)(w - P->rpos) < 2) {
+                    out_lr[i * 2] = P->hold[0];
+                    out_lr[i * 2 + 1] = P->hold[1];
+                    continue;
+                }
             }
+            int i0 = (int)(P->rpos & HEAR_MASK);
+            int i1 = (int)((P->rpos + 1) & HEAR_MASK);
+            int frac = (int)(P->rfrac >> 8);
+            int sum[2] = { 0, 0 };
+            for (int p = 0; p < lim; p++) {
+                if ((mask & (1u << p)) == 0) continue;
+                for (int ch = 0; ch < 2; ch++) {
+                    int a = g_ring[i0][p * 2 + ch];
+                    int b = g_ring[i1][p * 2 + ch];
+                    sum[ch] += a + ((b - a) * frac) / 256;
+                }
+            }
+            for (int ch = 0; ch < 2; ch++) {
+                int v = sum[ch];
+                if (v > 32767) v = 32767;
+                if (v < -32768) v = -32768;
+                out_lr[i * 2 + ch] = (int16_t)v;
+                P->hold[ch] = (int16_t)v;
+            }
+            uint32_t acc = P->rfrac + step;
+            P->rpos += acc >> 16;
+            P->rfrac = acc & 0xffff;
         }
-        for (int ch = 0; ch < 2; ch++) {
-            int v = sum[ch];
-            if (v > 32767) v = 32767;
-            if (v < -32768) v = -32768;
-            out_lr[i * 2 + ch] = (int16_t)v;
-        }
-        uint32_t acc = P->rfrac + step;
-        P->rpos += acc >> 16;
-        P->rfrac = acc & 0xffff;
     }
 }
 

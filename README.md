@@ -10,7 +10,7 @@ Several copies can sit on several tracks. They share one USB read. Each copy sum
 
 ## Caveats
 
-- There is a small amount of latency. On a Digitone II the plugin holds about 4 milliseconds of audio behind the newest USB sample, so a late packet does not become a gap. That can leave the audio a little late against the MPC grid. The plugin cannot shift the other tracks to match. USB or DIN, and which machine is the clock, do not remove that wait. The spare is `HEAR_LAG` in `src/probe.c`. The two clocks drift, so if the spare grows it is walked back without a skip.
+- There is a small amount of latency. On a Digitone II the plugin holds about 4 milliseconds of audio behind the newest USB sample, so a late packet does not become a gap. That can leave the audio a little late against the MPC grid. The plugin cannot shift the other tracks to match. USB or DIN, and which machine is the clock, do not remove that wait. The spare is `HEAR_LAG` in `src/probe.c`. The two clocks drift. If the spare grows or shrinks, playback walks a hair faster or slower until it is back. A packet that is later than the spare repeats the last sample instead of dropping to silence.
 - Eight copies is the maximum in one project unless Hakai is installed. That is the MPC's own plugin limit.
 - Other Overbridge machines are listed and untested. Only the Digitone II has been heard. Testers are welcome. Analog Rytm MKI, Analog Four MKI and Analog Keys are unsupported, same as Overwitch. They use the older Overbridge 1 link, and Tributary only speaks the interrupt one.
 - You can only listen on the plugin track. The sound comes out of the track Tributary sits on. It is not a separate USB audio device. One copy sums the switches that are on.
