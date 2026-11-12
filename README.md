@@ -14,7 +14,7 @@ Several copies can sit on several tracks. They share one USB read. Each copy sum
 - Eight copies is the maximum in one project unless Hakai is installed. That is the MPC's own plugin limit.
 - Other Overbridge machines are listed and untested. Only the Digitone II has been heard. Testers are welcome. Analog Rytm MKI, Analog Four MKI and Analog Keys are unsupported, same as Overwitch. They use the older Overbridge 1 link, and Tributary only speaks the interrupt one.
 - You can only listen on the plugin track. The sound comes out of the track Tributary sits on. It is not a separate USB audio device. One copy sums the switches that are on.
-- Recording needs a resample. The sound is live USB audio, so a bounce does not capture it. Resample the track, or a submix, with the MPC sampler while it plays.
+- Recording needs a resample, or the Capture tab. The sound is live USB audio, so a bounce does not capture it. Resample the track, or open Capture and record a bar-locked wav. See `CAPTURE.md`.
 - Use the MPC as the clock. Set the Digitone to follow MIDI clock and press play on the MPC. The Digitone can be the clock instead. Play and tempo do reach the MPC, and they wobble, because the clock shares the USB cable with the audio. The screen says **MPC is the clock** along the bottom for this reason.
 
 ## What you need
@@ -43,6 +43,10 @@ The rendered screen is `screenshots/tributary.png`. The artwork and the lamp fra
 Take the plugin off the track when you are finished. The last copy releases the audio interfaces. The Digitone's MIDI interface is left on its driver the whole time, and loading Tributary wires the sequencer link between the Digitone and the MPC.
 
 The switch names follow the connected device. Maps for Digitakt, Digitakt II, Digitone, Digitone Keys, Syntakt, Analog Rytm MKII, Analog Four MKII, and Analog Heat (including MKII and +FX) come from Overwitch's device list. They are untested. Digitakt II uses the same outputs as Digitone II.
+
+## Capture
+
+The second tab records the sound on this track for 1, 2, 4, 8, or 16 bars and writes a 24-bit wav. It starts on a bar from the MPC clock, then waits out the monitoring spare (162 samples, about 3.7 ms) so the file sits with sequenced material. The knobs, the file name, and what to check on the MPC are in `CAPTURE.md`.
 
 ## Install
 
@@ -94,7 +98,7 @@ The compile itself matches `build_port.sh`: `arm32v7/gcc:11-bullseye` (`--platfo
 docker run --rm --platform linux/arm/v7 -v "$PWD":/src -v "$MPC_VST":/mv:ro -w /src arm32v7/gcc:11-bullseye \
   gcc -O2 -Wall -Wextra -Wno-unused-parameter -fPIC -shared -fvisibility=hidden -std=gnu11 \
       -pthread -Ivst/build \
-      src/probe.c /mv/wrapper/vst2_wrap.c \
+      src/probe.c src/capture.c /mv/wrapper/vst2_wrap.c \
       -pthread -lm -Wl,--no-undefined \
       -o vst/build/tributary.so
 ```
@@ -105,7 +109,7 @@ AArch64, for `pluginList-arm-64bit` on a Gen2 MPC. Same flags, `arm64v8/gcc:12-b
 docker run --rm --platform linux/arm64 -v "$PWD":/src -v "$MPC_VST":/mv:ro -w /src arm64v8/gcc:12-bookworm \
   gcc -O2 -Wall -Wextra -Wno-unused-parameter -fPIC -shared -fvisibility=hidden -std=gnu11 \
       -pthread -Ivst/build \
-      src/probe.c /mv/wrapper/vst2_wrap.c \
+      src/probe.c src/capture.c /mv/wrapper/vst2_wrap.c \
       -pthread -lm -Wl,--no-undefined \
       -o vst/build/tributary-aarch64.so
 ```
@@ -121,10 +125,11 @@ python3 tools/pack_release.py --so vst/build/tributary.so \
 
 `--arch aarch64` writes `pluginList-arm-64bit` instead of `pluginList-arm`.
 
-The host test checks the USB decisions and the device table on a fake bus. It needs Linux headers, so it runs in a container:
+The host test checks the USB decisions, the device table, and that arming Capture does not change the monitored audio. It needs Linux headers, so it runs in a container. The capture timing test is the same script, and it also runs on a Mac:
 
 ```
 sh test/run.sh
+cc -std=gnu11 -O1 -Wall -Wextra -pthread -o /tmp/capture_test test/capture_test.c src/capture.c -lm && /tmp/capture_test
 ```
 
 ## Further development

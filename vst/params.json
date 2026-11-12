@@ -24,6 +24,14 @@
     {"key": "s17", "name": "DLY", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
     {"key": "s18", "name": "REV", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
     {"key": "s19", "name": "CHO", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
-    {"key": "s20", "name": "IN", "min": 0, "max": 1, "default": 0, "dynamic_name": true}
+    {"key": "s20", "name": "IN", "min": 0, "max": 1, "default": 0, "dynamic_name": true},
+    {"key": "cap_len", "name": "Bars", "min": 0, "max": 4, "default": 2, "options": ["1", "2", "4", "8", "16"]},
+    {"key": "cap_arm", "name": "Arm", "min": 0, "max": 1, "default": 0},
+    {"key": "cap_src", "name": "Source", "min": 0, "max": 21, "default": 0, "options": ["mix", "main", "track 1", "track 2", "track 3", "track 4", "track 5", "track 6", "track 7", "track 8", "track 9", "track 10", "track 11", "track 12", "track 13", "track 14", "track 15", "track 16", "delay", "reverb", "chorus", "input"]},
+    {"key": "cap_dest", "name": "Folder", "min": 0, "max": 3, "default": 0, "options": ["plugin", "internal", "sd", "usb"]},
+    {"key": "cap_auto", "name": "Rearm", "min": 0, "max": 1, "default": 0},
+    {"key": "cap_cancel", "name": "Cancel", "min": 0, "max": 1, "default": 0},
+    {"key": "cap_status", "name": "Status", "min": 0, "max": 1, "default": 0, "display": "string"},
+    {"key": "cap_path", "name": "Path", "min": 0, "max": 1, "default": 0, "display": "string"}
   ]
 }

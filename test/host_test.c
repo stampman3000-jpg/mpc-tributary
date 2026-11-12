@@ -465,6 +465,44 @@ int main(void) {
         e->destroy(fresh);
     }
 
+    {
+        void *a = e->create("/media/EOS_DIGITAL/VST2 Plugins/johnny - VST - Tributary");
+        void *b = e->create("/media/EOS_DIGITAL/VST2 Plugins/johnny - VST - Tributary");
+        int16_t oa[64], ob[64];
+        char st[64], path[256];
+        int i, same = 1;
+        check(e->song_pos != 0, "transport hook is present");
+        e->get_param(a, "cap_status", st, 64);
+        check(!strcmp(st, "Idle"), "capture starts idle");
+        e->get_param(a, "cap_path", path, sizeof path);
+        check(!strcmp(path, "/media/EOS_DIGITAL/Tributary Captures"),
+              "capture folder follows the drive the plugin loaded from");
+        for (i = 0; i < HEAR_CAP; i++) {
+            g_ring[i][0] = 7000;
+            g_ring[i][1] = -7000;
+        }
+        atomic_store(&g_exited, 0);
+        atomic_store(&g_alive, 1);
+        e->set_param(a, "active", "1");
+        e->set_param(b, "active", "1");
+        atomic_store(&g_w, 4000);
+        e->set_param(b, "cap_dir", "/tmp/opfix-cap");
+        e->set_param(b, "cap_arm", "1");
+        e->get_param(b, "cap_status", st, 64);
+        check(!strcmp(st, "Armed"), "arm waits for the bar");
+        e->song_pos(b, 0.5, 120.0, 0, 32);
+        e->render(a, oa, 32);
+        e->render(b, ob, 32);
+        for (i = 0; i < 64; i++) if (oa[i] != ob[i]) same = 0;
+        check(same && oa[0] == 7000 && oa[1] == -7000, "arming capture does not change the monitored audio");
+        e->set_param(b, "cap_cancel", "1");
+        e->get_param(b, "cap_status", st, 64);
+        check(!strcmp(st, "Cancelled"), "cancel drops the take");
+        e->destroy(a);
+        e->destroy(b);
+        atomic_store(&g_alive, 0);
+    }
+
     char buf[64] = "";
     check(e->get_param(inst, "run", buf, sizeof buf) == 0, "trigger key has no readout text");
     check(e->get_param(inst, "state", buf, sizeof buf) == 0, "no state chunk is saved");

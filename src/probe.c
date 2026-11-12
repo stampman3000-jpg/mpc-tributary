@@ -40,6 +40,7 @@
 #include <unistd.h>
 #include <linux/usbdevice_fs.h>
 #include "devices.h"
+#include "capture.h"
 
 /* The transfer structs are the ones in <linux/usbdevice_fs.h>. Their buffer
  * pointers are native pointers, so a 64-bit build is not a 32-bit layout with
@@ -93,6 +94,7 @@ static int repair_seq_link(void);
 #define HEAR_NUDGE 40
 _Static_assert(HEAR_LAG > HEAR_NUDGE, "the spare has to be deeper than the walk band");
 _Static_assert(HEAR_CAP / 2 > HEAR_LAG * 2, "a stall is longer than a short spare");
+_Static_assert(CAP_HEAR_LAG == HEAR_LAG, "capture waits out the same spare the monitor uses");
 
 typedef struct {
     pthread_mutex_t lock;
@@ -107,6 +109,9 @@ typedef struct {
     int saw_source; /* an old project set SOURCE; switch defaults must not add Main on top */
     int switches_live; /* host audio has started, so a switch move is the player, not a default */
     char v[TXT], dev[TXT], claim[TXT], rel[TXT], mid[TXT], logst[TXT];
+    cap_t *cap;
+    int16_t *cap_tmp;
+    int cap_arm_held;
 } probe_t;
 
 /* One reader for the whole process. Instances only pick a pair. */
@@ -1668,7 +1673,9 @@ static int repair_seq_link(void) {
     return rc;
 }
 
-/* ---- engine interface (same six-slot shape as wrapper/engine.h) ---------- */
+/* Engine slots match the current open-mpc wrapper. process stays null.
+ * song_pos is the transport hook (ppq, tempo, playing). The fuller clock,
+ * with meter and loop points, is tributary_host_time. */
 
 typedef struct {
     void *(*create)(const char *data_dir);
@@ -1677,13 +1684,16 @@ typedef struct {
     void (*set_param)(void *inst, const char *key, const char *val);
     int (*get_param)(void *inst, const char *key, char *buf, int buf_len);
     void (*render)(void *inst, int16_t *out_lr, int frames);
+    void (*process)(void *inst, int16_t *out_lr, int frames);
+    void (*song_pos)(void *inst, double ppq, double bpm, int playing, int frames);
 } mpc_engine_t;
 
 static void *create(const char *data_dir) {
-    (void)data_dir;
     probe_t *P = calloc(1, sizeof *P);
     if (!P) return NULL;
     pthread_mutex_init(&P->lock, NULL);
+    P->cap = cap_create(data_dir);
+    P->cap_tmp = calloc(512 * 2, sizeof(int16_t));
     pthread_mutex_lock(&g_mu);
     g_instances++;
     pthread_mutex_unlock(&g_mu);
@@ -1719,6 +1729,8 @@ static void destroy(void *inst) {
         pthread_mutex_unlock(&g_mu);
     }
     pthread_mutex_destroy(&P->lock);
+    cap_destroy(P->cap);
+    free(P->cap_tmp);
     free(P);
 }
 
@@ -1734,6 +1746,28 @@ static void set_param(void *inst, const char *key, const char *val) {
     else if (!strcmp(key, "active")) {
         if (atof(val) > 0.5) hear_on(P);
         else hear_off(P);
+    } else if (!strcmp(key, "cap_len")) {
+        if (P->cap) cap_set_len_index(P->cap, (int)atof(val));
+    } else if (!strcmp(key, "cap_arm")) {
+        int on = atof(val) > 0.5;
+        if (on && !P->cap_arm_held && P->cap) {
+            const tb_dev *d = tb_current();
+            cap_set_tag(P->cap, d && d->name ? d->name : "");
+            cap_arm(P->cap);
+        }
+        P->cap_arm_held = on;
+    } else if (!strcmp(key, "cap_src")) {
+        if (P->cap) cap_set_source(P->cap, (int)atof(val));
+    } else if (!strcmp(key, "cap_dest")) {
+        if (P->cap) cap_set_dest(P->cap, (int)atof(val));
+    } else if (!strcmp(key, "cap_auto")) {
+        if (P->cap) cap_set_auto(P->cap, atof(val) > 0.5);
+    } else if (!strcmp(key, "cap_cancel")) {
+        if (P->cap && atof(val) > 0.5) cap_cancel(P->cap);
+    } else if (!strcmp(key, "cap_dir")) {
+        if (P->cap) cap_set_override(P->cap, val);
+    } else if (!strcmp(key, "cap_latency")) {
+        if (P->cap) cap_set_latency(P->cap, (int)atof(val));
     } else if (!strcmp(key, "pair") || !strcmp(key, "source")) {
         int n = (int)atof(val);
         int lim = src_lim();
@@ -1827,12 +1861,70 @@ static int get_param(void *inst, const char *key, char *buf, int buf_len) {
     } else if (!strcmp(key, "srcname")) {
         uint32_t m = atomic_load_explicit(&P->mix, memory_order_relaxed);
         return mix_label(m, buf, buf_len), (int)strlen(buf);
+    } else if (!strcmp(key, "cap_status")) {
+        return P->cap ? cap_status(P->cap, buf, buf_len) : 0;
+    } else if (!strcmp(key, "cap_path")) {
+        return P->cap ? cap_path(P->cap, buf, buf_len) : 0;
+    } else if (!strcmp(key, "cap_len")) {
+        return snprintf(buf, buf_len, "%d", cap_len_index(P->cap));
+    } else if (!strcmp(key, "cap_src")) {
+        return snprintf(buf, buf_len, "%d", cap_source(P->cap));
+    } else if (!strcmp(key, "cap_dest")) {
+        return snprintf(buf, buf_len, "%d", cap_dest(P->cap));
+    } else if (!strcmp(key, "cap_auto")) {
+        return snprintf(buf, buf_len, "%d", cap_auto(P->cap));
+    } else if (!strcmp(key, "cap_arm")) {
+        return snprintf(buf, buf_len, "%d", cap_arm_on(P->cap));
+    } else if (!strcmp(key, "cap_cancel")) {
+        return snprintf(buf, buf_len, "0");
     }
     if (!src) return 0;
     pthread_mutex_lock(&P->lock);
     int n = snprintf(buf, buf_len, "%s", src);
     pthread_mutex_unlock(&P->lock);
     return n;
+}
+
+/* One output, read from the same spare the monitor just used.
+ * This does not move the monitor's read pointer. */
+static void cap_one(int16_t *dst, int frames, uint32_t rp, uint32_t rf, uint32_t step, int pair) {
+    int16_t hold0 = 0, hold1 = 0;
+    for (int i = 0; i < frames; i++) {
+        uint32_t w = atomic_load_explicit(&g_w, memory_order_acquire);
+        if ((uint32_t)(w - rp) < 2) {
+            dst[i * 2] = hold0;
+            dst[i * 2 + 1] = hold1;
+            continue;
+        }
+        int i0 = (int)(rp & HEAR_MASK);
+        int i1 = (int)((rp + 1) & HEAR_MASK);
+        int frac = (int)(rf >> 8);
+        for (int ch = 0; ch < 2; ch++) {
+            int a = g_ring[i0][pair * 2 + ch];
+            int b = g_ring[i1][pair * 2 + ch];
+            int v = a + ((b - a) * frac) / 256;
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            dst[i * 2 + ch] = (int16_t)v;
+            if (ch == 0) hold0 = (int16_t)v;
+            else hold1 = (int16_t)v;
+        }
+        uint32_t acc = rf + step;
+        rp += acc >> 16;
+        rf = acc & 0xffff;
+    }
+}
+
+static void cap_push(probe_t *P, const int16_t *out_lr, int frames,
+                     int walked, uint32_t rp, uint32_t rf, uint32_t step) {
+    if (!P || !P->cap) return;
+    int src = cap_source(P->cap);
+    if (walked && cap_keep_count(P->cap) > 0 && src > 0 && P->cap_tmp && frames > 0 && frames <= 512) {
+        cap_one(P->cap_tmp, frames, rp, rf, step, src - 1);
+        cap_audio(P->cap, P->cap_tmp, frames);
+        return;
+    }
+    if (out_lr) cap_audio(P->cap, out_lr, frames);
 }
 
 static void render(void *inst, int16_t *out_lr, int frames) {
@@ -1850,9 +1942,13 @@ static void render(void *inst, int16_t *out_lr, int frames) {
             if (!strcmp(P->v, "HEARING")) snprintf(P->v, TXT, "STOPPED");
             pthread_mutex_unlock(&P->lock);
         }
+        cap_push(P, out_lr, frames, 0, 0, 0, 0);
         return;
     }
-    if (!P->active) return;
+    if (!P->active) {
+        cap_push(P, out_lr, frames, 0, 0, 0, 0);
+        return;
+    }
     if (!P->saw) {
         P->saw = 1;
         pthread_mutex_lock(&P->lock);
@@ -1864,7 +1960,10 @@ static void render(void *inst, int16_t *out_lr, int frames) {
     uint32_t mask = atomic_load_explicit(&P->mix, memory_order_relaxed);
     if (lim < 32) mask &= (1u << lim) - 1u;
     if (!P->primed) {
-        if (w < HEAR_LAG) return;
+        if (w < HEAR_LAG) {
+            cap_push(P, out_lr, frames, 0, 0, 0, 0);
+            return;
+        }
         P->primed = 1;
         P->rpos = w - HEAR_LAG;
         P->rfrac = 0;
@@ -1878,6 +1977,7 @@ static void render(void *inst, int16_t *out_lr, int frames) {
     {
         uint32_t behind = (uint32_t)(w - P->rpos);
         uint32_t step = HEAR_STEP;
+        uint32_t cap_rp = P->rpos, cap_rf = P->rfrac;
         if (behind > (uint32_t)HEAR_LAG + (uint32_t)HEAR_NUDGE)
             step += 32u;
         else if (behind < (uint32_t)HEAR_LAG - (uint32_t)HEAR_NUDGE)
@@ -1914,8 +2014,32 @@ static void render(void *inst, int16_t *out_lr, int frames) {
             P->rpos += acc >> 16;
             P->rfrac = acc & 0xffff;
         }
+        cap_push(P, out_lr, frames, 1, cap_rp, cap_rf, step);
     }
 }
 
-static const mpc_engine_t API = { create, destroy, midi, set_param, get_param, render };
+void tributary_host_time(void *inst, double ppq, double bpm, int playing, int frames,
+                         int numer, int denom, double bar_start,
+                         int cycle, double cycle_start, double cycle_end) {
+    probe_t *P = inst;
+    cap_time_t t;
+    if (!P || !P->cap) return;
+    t.ppq = ppq;
+    t.bpm = bpm;
+    t.numer = numer >= 1 ? numer : 4;
+    t.denom = denom >= 1 ? denom : 4;
+    t.bar_start = bar_start;
+    t.playing = playing && ppq >= 0.0 && bpm > 0.0;
+    t.cycle = cycle;
+    t.cycle_start = cycle_start;
+    t.cycle_end = cycle_end;
+    t.frames = frames;
+    cap_transport(P->cap, &t);
+}
+
+static void song_pos(void *inst, double ppq, double bpm, int playing, int frames) {
+    tributary_host_time(inst, ppq, bpm, playing, frames, 4, 4, -1.0, 0, 0.0, 0.0);
+}
+
+static const mpc_engine_t API = { create, destroy, midi, set_param, get_param, render, NULL, song_pos };
 const mpc_engine_t *mpc_engine(void) { return &API; }

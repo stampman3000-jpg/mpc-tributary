@@ -2,8 +2,8 @@
   "name": "Tributary",
   "vendor": "johnny",
   "uid": "Trib",
-  "version": 1100,
-  "defines": { "HAS_DISPLAY_REV": 1 },
+  "version": 1200,
+  "defines": { "HAS_DISPLAY_REV": 1, "HAS_SONG_POS": 1 },
   "targets": ["armv7", "aarch64"],
   "so": "tributary.so",
   "params": "params.json",
@@ -12,7 +12,8 @@
   "build": {
     "root": "..",
     "sources": [
-      "src/probe.c"
+      "src/probe.c",
+      "src/capture.c"
     ],
     "cflags": [
       "-pthread"
