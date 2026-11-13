@@ -13,8 +13,8 @@
 
 /* Monitoring sits this many Digitone frames (48 kHz) behind the newest sample.
  * probe.c's HEAR_LAG must stay the same number. At 44.1 kHz that wait is
- * CAP_LATENCY_SAMPLES of the file, about 3.7 ms. */
-#define CAP_HEAR_LAG 176
+ * CAP_LATENCY_SAMPLES of the file, about 11 ms, enough for a 256-sample block. */
+#define CAP_HEAR_LAG 512
 #define CAP_LATENCY_SAMPLES ((CAP_HEAR_LAG * CAP_SR + 24000) / 48000)
 
 enum {

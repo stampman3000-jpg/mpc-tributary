@@ -2,7 +2,7 @@
   "name": "Tributary",
   "vendor": "johnny",
   "uid": "Trib",
-  "version": 1230,
+  "version": 1240,
   "defines": { "HAS_DISPLAY_REV": 1, "DISPLAY_REV_THREAD": 1, "HAS_SONG_POS": 1, "MODULE_SUBDIR": "\".\"" },
   "targets": ["armv7", "aarch64"],
   "so": "tributary.so",

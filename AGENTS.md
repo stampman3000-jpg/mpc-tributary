@@ -32,7 +32,7 @@ Do not commit `vst/build/`, `dist/`, `*.so`, or any other binary. Those paths ar
 sh test/run.sh
 ```
 
-It must print `ALL PASSED` twice. A real USB claim still needs an MPC. The probe test checks the decisions on a fake bus: which device is chosen, that interface 5 is left on its driver, the device table, that two copies can sum different outputs from one read, and that arming Capture does not change that audio. The capture test checks bar alignment, exact length, the 162-sample wait, a loop wrap, and the aborts. It does not load the plugin in the official SDK host-sim. Host-sim is for an SDK-built plugin. The fields it reports are the ones `cap_time_t` takes.
+It must print `ALL PASSED` twice. A real USB claim still needs an MPC. The probe test checks the decisions on a fake bus: which device is chosen, that interface 5 is left on its driver, the device table, that two copies can sum different outputs from one read, and that arming Capture does not change that audio. The capture test checks bar alignment, exact length, the spare wait, a loop wrap, and the aborts. It does not load the plugin in the official SDK host-sim. Host-sim is for an SDK-built plugin. The fields it reports are the ones `cap_time_t` takes.
 
 ## Release
 

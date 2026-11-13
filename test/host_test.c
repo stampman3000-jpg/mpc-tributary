@@ -383,6 +383,29 @@ int main(void) {
         atomic_store(&g_alive, 0);
     }
     {
+        /* The top of the Digitone's range. A straight line folds it back into the note. */
+        void *tone = e->create(NULL);
+        int16_t out[256];
+        int i, peak = 0;
+        for (i = 0; i < HEAR_CAP; i++) {
+            int16_t s = (i & 1) ? -8000 : 8000;
+            g_ring[i][0] = s;
+            g_ring[i][1] = s;
+        }
+        atomic_store(&g_exited, 0);
+        atomic_store(&g_alive, 1);
+        atomic_store(&g_w, 4000);
+        e->set_param(tone, "active", "1");
+        e->render(tone, out, 128);
+        for (i = 0; i < 256; i++) {
+            int a = out[i] < 0 ? -out[i] : out[i];
+            if (a > peak) peak = a;
+        }
+        check(peak < 200, "the Digitone's top end is filtered instead of folding into the melody");
+        e->destroy(tone);
+        atomic_store(&g_alive, 0);
+    }
+    {
         unsigned char pkt[OP_PKT_BYTES];
         uint32_t w0, w1;
         int f;
@@ -408,8 +431,24 @@ int main(void) {
         push_frames(pkt);
         check(atomic_load(&g_w) == w1 + (uint32_t)OP_FRAMES * 2,
               "a missed block is filled before the next one");
-        check(g_ring[w1][0] == g_ring[w1 - 1][0], "the fill repeats the last sample");
-        check(g_ring[w1 + OP_FRAMES][0] != g_ring[w1][0], "the late block follows the fill");
+        {
+            int prev = g_ring[w1 - 1][0];
+            int late = g_ring[w1 + OP_FRAMES][0];
+            int raw = late - prev;
+            int biggest = 0;
+            int s;
+            if (raw < 0) raw = -raw;
+            for (s = 0; s <= OP_FRAMES; s++) {
+                int a = s == 0 ? prev : g_ring[w1 + s - 1][0];
+                int b = g_ring[w1 + s][0];
+                int d = b - a;
+                if (d < 0) d = -d;
+                if (d > biggest) biggest = d;
+            }
+            check(raw > 1000 && biggest * 4 < raw,
+                  "a missed block slides into the next one instead of ticking");
+            check(late != prev, "the late block follows the slide");
+        }
         g_ctr_set = 0;
         atomic_store(&g_lamp, 0);
         for (f = 0; f < TB_MAX; f++) atomic_store(&g_use[f], 0);

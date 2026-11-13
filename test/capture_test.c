@@ -127,7 +127,7 @@ int main(void) {
     char status[128], path[1024];
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 2; }
 
-    check(CAP_LATENCY_SAMPLES == 162, "the monitoring spare is 162 MPC samples");
+    check(CAP_LATENCY_SAMPLES == 470, "the monitoring spare is 470 MPC samples");
     check(cap_length_frames(4, 4, 4, 120.0) == 352800, "4 bars at 120 is 352800 samples");
     check(cap_length_frames(1, 4, 4, 120.0) == 88200, "1 bar at 120 is 88200 samples");
     check(cap_length_frames(2, 3, 4, 120.0) == 132300, "2 bars of 3/4 at 120 is 132300 samples");

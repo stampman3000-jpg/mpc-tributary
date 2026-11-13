@@ -48,7 +48,7 @@ The clock is the MPC's, once per audio block. Not the screen, and not the clock 
 
 The open-mpc wrapper used to build Tributary only forwards the playhead, the tempo, and playing, and only if the build has `HAS_SONG_POS`. Until a wrapper also forwards the meter, Capture counts **4/4**. A 3/4 project would be the wrong length. The computer test does check 3/4 when the meter is passed in.
 
-The file starts **162 samples** after the bar line. That is the monitoring spare: 176 Digitone samples at 48 kHz, which is 162 samples at the MPC's 44.1 kHz, about 3.7 ms. The sound that belongs on the bar arrives that late. Starting the file then puts beat 1 at the start of the wav, in line with something you sequenced on the MPC. The spare itself is not changed. `HEAR_LAG` in `src/probe.c` is still 176.
+The file starts **470 samples** after the bar line. That is the monitoring spare: 512 Digitone samples at 48 kHz, which is 470 samples at the MPC's 44.1 kHz, about 11 ms. The spare is that long so a 256-sample MPC block does not run out of Digitone audio. The sound that belongs on the bar arrives that late. Starting the file then puts beat 1 at the start of the wav, in line with something you sequenced on the MPC. `HEAR_LAG` in `src/probe.c` is 512.
 
 The length is the bars, at the tempo the take started at, at the Digitone's 48 kHz. 4 bars at 120 is 384000 samples, which is 8 seconds. The file is those samples as the Digitone sent them. It does not run them through the quick conversion the live track uses to fit the MPC's 44.1 kHz. That conversion is what made a take sound unlike the machine. The track you hear while it records is unchanged.
 
@@ -66,7 +66,7 @@ Checked on the computer:
 
 - The take starts on the exact sample of the bar, including when that sample is in the middle of a block of 32, 128, or 256.
 - The file is the exact number of samples for the bars and the tempo. 4/4 and 3/4.
-- The real 162-sample wait, and a shorter 10-sample wait, both shift the start by that many samples.
+- The real 470-sample wait, and a shorter 10-sample wait, both shift the start by that many samples.
 - A loop that jumps back to its start keeps the samples in order. A bar-to-bar jump does too when the loop points were not passed in.
 - A tempo change, a stop, a jump into the middle of a bar, and a jump to a different bar when the loop points say that is not the loop, each throw the take away and do not leave a file.
 - Played back to back, the join is the next sample of the same wave.
@@ -92,7 +92,7 @@ The Akai SDK is the reference for what the host reports and for the folder layou
 
 - Arm, press play, and the status goes from Armed to Recording on the next bar, not when you touch the knob.
 - The track you are hearing does not mute or change while it records or saves.
-- Load the wav on a pad and play it against a kick you sequenced on beat 1. The start should sit with that kick, not late by a noticeable gap. The 3.7 ms wait is small. If it is obviously late or early, say so before anyone changes `HEAR_LAG`.
+- Load the wav on a pad and play it against a kick you sequenced on beat 1. The start should sit with that kick, not late by a noticeable gap. The 11 ms wait is the room a 256-sample block needs. If it is obviously late or early, say so before anyone changes `HEAR_LAG`.
 - Loop the wav. The join should not click.
 - Change tempo while it is recording. The line should say the tempo changed, and no file should appear.
 - Hit stop while it is recording. Same, with transport stopped.

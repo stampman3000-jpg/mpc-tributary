@@ -1,5 +1,11 @@
 [
   {
+    "version": "1.2.4",
+    "device": "MPC One",
+    "firmware": "3.10.1.12",
+    "date": "2026-11-13"
+  },
+  {
     "version": "1.1.0",
     "device": "MPC One",
     "firmware": "3.9.1.2",
