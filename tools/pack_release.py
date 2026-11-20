@@ -2,7 +2,7 @@
 """Pack a Tributary zip for one MPC architecture.
 
   python3 tools/pack_release.py --so vst/build/tributary.so \
-      --skin "vst/build/skin/johnny - VST - Tributary" --arch armv7 --version 1.0.0
+      --skin "vst/build/skin/Stampman3000 - VST - Tributary" --arch armv7 --version 1.0.0
 
 armv7 writes pluginList-arm. aarch64 writes pluginList-arm-64bit.
 The .so is not committed; it only goes in the zip this script writes under dist/.
@@ -41,7 +41,7 @@ set -e
 cd "$(dirname "$0")"
 NAME='Tributary'
 SO='tributary.so'
-SKIN='johnny - VST - Tributary'
+SKIN='Stampman3000 - VST - Tributary'
 UID_HEX='54726962'
 ARCH='@ARCH@'
 LIST='@LIST@'
@@ -116,7 +116,7 @@ set -e
 cd "$(dirname "$0")"
 NAME='Tributary'
 SO='tributary.so'
-SKIN='johnny - VST - Tributary'
+SKIN='Stampman3000 - VST - Tributary'
 UID_HEX='54726962'
 LIST='@LIST@'
 SYNTHS=""
@@ -184,7 +184,7 @@ Install
 If Synths lives somewhere else, pass it:
   sh install.sh -t /media/EOS_DIGITAL/Synths
 
-The installer stops MPC, copies "johnny - VST - Tributary" into the Synths folder,
+The installer stops MPC, copies "Stampman3000 - VST - Tributary" into the Synths folder,
 backs up MPC.settings, adds the plugin line to {list}, and starts MPC again.
 Add -y to skip the question.
 
@@ -192,11 +192,11 @@ Uninstall
   sh uninstall.sh
 
 By hand
-- Copy portable/johnny - VST - Tributary/ into the Synths folder.
+- Copy portable/Stampman3000 - VST - Tributary/ into the Synths folder.
 - Stop MPC (systemctl stop acvs, or inmusic-mpc where that is the service).
 - Back up MPC.settings.
 - Inside <VALUE name="{list}"><KNOWNPLUGINS>, add the line from
-  portable/johnny - VST - Tributary/plugin-meta.xml, with %payload-path%
+  portable/Stampman3000 - VST - Tributary/plugin-meta.xml, with %payload-path%
   replaced by the Synths folder.
 - Start MPC.
 
@@ -231,8 +231,8 @@ def main():
     args = ap.parse_args()
     info = ARCHES[args.arch]
     skin_name = os.path.basename(os.path.normpath(args.skin))
-    if skin_name != "johnny - VST - Tributary":
-        raise SystemExit("skin folder must be named 'johnny - VST - Tributary'")
+    if skin_name != "Stampman3000 - VST - Tributary":
+        raise SystemExit("skin folder must be named 'Stampman3000 - VST - Tributary'")
     if os.path.basename(args.so) != "tributary.so":
         raise SystemExit("--so must be tributary.so")
     for need in ("version.xml", "Plugin Skins/TUI.json"):
@@ -247,7 +247,7 @@ def main():
     shutil.copy2(args.so, os.path.join(dest, "tributary.so"))
     meta = (
         '<PLUGIN name="Tributary" descriptiveName="Tributary" format="VST" '
-        'category="Synth" manufacturer="johnny" version="1.0" '
+        'category="Synth" manufacturer="Stampman3000" version="1.0" '
         'file="%payload-path%/' + skin_name + '/tributary.so" uid="54726962" isInstrument="1" '
         'fileTime="0" infoUpdateTime="0" numInputs="0" numOutputs="2" isShell="0"/>\n'
     )

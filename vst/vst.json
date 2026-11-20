@@ -1,8 +1,8 @@
 {
   "name": "Tributary",
-  "vendor": "johnny",
+  "vendor": "Stampman3000",
   "uid": "Trib",
-  "version": 1250,
+  "version": 1260,
   "defines": { "HAS_DISPLAY_REV": 1, "DISPLAY_REV_THREAD": 1, "HAS_SONG_POS": 1, "MODULE_SUBDIR": "\".\"" },
   "targets": ["armv7", "aarch64"],
   "so": "tributary.so",
