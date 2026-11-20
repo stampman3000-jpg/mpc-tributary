@@ -141,3 +141,5 @@ This has been heard on one Digitone II. It would be good to see other people tak
 This program is free software under the GNU General Public License, version 3. See `LICENSE`.
 
 Device ids and the channel maps are facts from [Overwitch](https://github.com/dagargo/overwitch) by David García Goñi (dagargo), also GPL-3. No Overwitch source is copied into this tree.
+
+☕ If this saves you time, you can [buy me a coffee](https://paypal.me/johnnybarter1).
