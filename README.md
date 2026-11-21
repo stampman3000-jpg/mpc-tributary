@@ -1,5 +1,9 @@
 # Tributary
 
+[![MPC Plugins](https://mpcplugins.github.io/badge/tributary.svg)](https://thediskking.com/plugins/tributary/)
+
+![Tributary](screenshots/tributary.png)
+
 A small Overwitch rework for MPC standalone. It plays Elektron Overbridge audio, over USB, on the MPC track the plugin sits on. One copy can sum several outputs. The Digitone II is the machine this has been heard on.
 
 [![Tributary demo](https://img.youtube.com/vi/QJIlWZKR8m0/hqdefault.jpg)](https://youtu.be/QJIlWZKR8m0)

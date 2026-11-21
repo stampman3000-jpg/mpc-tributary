@@ -1,20 +1,30 @@
 [
   {
+    "id": "tributary",
     "version": "1.2.5",
     "device": "MPC One",
     "firmware": "3.10.1.12",
     "date": "2026-11-14"
   },
   {
+    "id": "tributary",
     "version": "1.2.4",
     "device": "MPC One",
     "firmware": "3.10.1.12",
     "date": "2026-11-13"
   },
   {
+    "id": "tributary",
     "version": "1.1.0",
     "device": "MPC One",
     "firmware": "3.9.1.2",
     "date": "2026-10-10"
+  },
+  {
+    "id": "tributary",
+    "version": "1.2.6",
+    "device": "MPC One",
+    "firmware": "3.10.1",
+    "date": "2026-11-21"
   }
 ]
