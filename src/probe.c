@@ -1825,6 +1825,10 @@ static void set_param(void *inst, const char *key, const char *val) {
         atomic_store_explicit(&P->level, level, memory_order_relaxed);
         P->mix_owned = 1;
         P->saw_source = 1;
+        /* A project load re-arms the switch-default guard: what the host replays
+         * after the load are defaults again, not player moves. A load that lands
+         * after audio has run would otherwise let them clear the saved routes. */
+        P->switches_live = 0;
         pthread_mutex_lock(&P->lock);
         mix_label(mix, P->rel, TXT);
         pthread_mutex_unlock(&P->lock);
