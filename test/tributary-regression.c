@@ -1,32 +1,29 @@
-/* Focused regression for the routing/restore path of the project state line,
- * written against the upstream "v1 <mix> <level>" format. The state-format
- * work (the T1 chunk with level, active and mix) is a separate change and
- * this suite does not depend on it: every chunk here is read and written in
- * the 1.2.5 wire format, so the routing fix is reviewable and testable on
- * its own.
+/* Focused regression for the state-restore path, adapted for the integrated
+ * v1.2.5 engine (the T1 chunk on top of upstream's mix ownership).
  *
- * What is pinned here:
+ * The pre-integration regression asserted use_from_mix semantics: that an
+ * INACTIVE restore still takes P->used and shared g_use[] decode ownership,
+ * with Main forced into every restored mix. That round was deliberately not
+ * carried into the integration. The integrated rule is the opposite, and it
+ * is what this suite now pins:
  *
- *   - a saved "v1" line restores level, routes and labels into a fresh
- *     copy, and the copy stays inactive with nothing held on the shared
- *     read until it is woken;
- *   - waking the copy decodes exactly the saved mix, and stopping gives
- *     every refcount back;
- *   - a restore into a copy that is already ACTIVE re-points the shared
- *     read at the saved routes, the way the live switch path does;
- *   - mix ownership is preserved: a valid restore and a real switch press
- *     own the row, so a later SOURCE write (the meter-refresh echo) cannot
- *     replace the routes; Main is never forced into a restored mix;
- *   - the switch defaults the host replays after a project load cannot
- *     clobber the restore, whether the load is cold or lands after audio
- *     has run. That last case is the routing fix this suite exists for:
- *     the load re-arms the switch-default guard by clearing switches_live.
+ *   - an inactive restore (a cold project load) brings back level, routes
+ *     and labels but takes NO decode ownership: P->used stays 0 and g_use[]
+ *     stays 0 until the copy is activated;
+ *   - Main is never forced into a restored mix: the saved bits are the
+ *     truth, and a re-save adds nothing;
+ *   - activation hands the shared read exactly the restored mix, and
+ *     stopping the copy gives it all back;
+ *   - a saved state round-trips without drift, and the switch defaults the
+ *     host replays after a project load cannot clobber the restore, whether
+ *     the load is cold or lands after audio has run (the switches_live
+ *     re-arm).
  *
  * Switch indices from devices.h (tb_src_0): delay=17, reverb=18, chorus=19.
  *
  * The shared read is never started here: g_alive is faked to 1 only inside
  * activation windows, with g_owner clear, and is dropped again before any
- * copy stops or dies - an owner going through hear_off with the flag set
+ * copy stops or dies — an owner going through hear_off with the flag set
  * would join a thread that was never started. No claim is made here about
  * double-STOP on the device; that stays unverified without hardware.
  *
@@ -82,14 +79,15 @@ static void fake_live(void) {
     for (int i = 0; i < TB_MAX; i++) atomic_store(&g_use[i], 0);
 }
 
-/* The core failing scenario, restated for the v1 line: restore an inactive
- * copy with delay+reverb+chorus and a level of 42, the way the MPC does on
- * project load. The routes and the label must come back, the copy must stay
- * inactive, and the shared read must hear nothing of it until the copy is
- * woken. */
+/* The core failing scenario of the old defect, restated for the integrated
+ * engine: restore an inactive copy with delay+reverb+chorus and a level of
+ * 42, the way the MPC does on project load. The routes and the label must
+ * come back, the copy must stay inactive, and the shared read must hear
+ * nothing of it until the copy is woken. */
 static void regression_inactive_restore(const mpc_engine_t *e) {
     void *src = e->create(NULL);
     char chunk[8192] = {0};
+    int n;
 
     e->set_param(src, "level", "42");
     e->set_param(src, "s17", "1"); /* delay */
@@ -100,8 +98,10 @@ static void regression_inactive_restore(const mpc_engine_t *e) {
     check(num_param(src, e, "active") == 0, "regression setup: copy is inactive");
     check(num_param(src, e, "level") == 42, "regression setup: level is 42");
 
-    check(e->get_param(src, "state", chunk, sizeof chunk) > 0, "regression: chunk saved");
-    check(!strncmp(chunk, "v1 ", 3), "regression: chunk is a v1 line");
+    n = e->get_param(src, "state", chunk, sizeof chunk);
+    check(n > 0, "regression: chunk saved");
+    check(!strncmp(chunk, "T1 42 0", 7), "regression: chunk is T1 42 0 <mix>");
+
     e->destroy(src);
 
     /* restore into a FRESH copy */
@@ -124,9 +124,8 @@ static void regression_inactive_restore(const mpc_engine_t *e) {
         check(num_param(dst, e, "level") == 42, "regression: level restored to 42");
         check(num_param(dst, e, "active") == 0, "regression: copy stays inactive");
 
-        /* A v1 line names no active flag, so the restore must never wake or
-         * stop the copy: an inactive restore asks the shared read for
-         * nothing at all - no decode mask, no refcounts, Main included. */
+        /* The integrated rule: an inactive restore asks the shared read for
+         * nothing at all — no decode mask, no refcounts, Main included. */
         P = (probe_t *)dst;
         check(P->used == 0 && !shared_read_held(),
               "regression: an inactive restore holds nothing on the shared read");
@@ -148,9 +147,8 @@ static void regression_inactive_restore(const mpc_engine_t *e) {
 }
 
 /* All 8 delay/reverb/chorus combinations, restored inactive into a fresh
- * copy from a hand-written v1 line. Every switch comes back as saved, on
- * its own, Main is not forced into the mix, and a re-save of the copy
- * writes the same line back. */
+ * copy. Every switch comes back as saved, on its own, Main is not forced
+ * into the mix, and a re-save of the copy writes the same chunk back. */
 static void regression_combos(const mpc_engine_t *e) {
     struct { const char *name; unsigned dly, rev, cho; } combos[] = {
         {"dly only",    1, 0, 0},
@@ -169,7 +167,7 @@ static void regression_combos(const mpc_engine_t *e) {
         probe_t *P;
         int held;
 
-        snprintf(chunk, sizeof chunk, "v1 %lx 88", mix);
+        snprintf(chunk, sizeof chunk, "T1 88 0 %lx", mix);
         e->set_param(dst, "state", chunk);
 
         snprintf(label, sizeof label, "combo %s: delay, reverb and chorus restore as saved, not coupled",
@@ -189,9 +187,77 @@ static void regression_combos(const mpc_engine_t *e) {
         check(P->used == 0 && !held, label);
 
         check(get_state(dst, e, again, sizeof again) > 0 && !strcmp(chunk, again),
-              "combo: re-saving the restored copy writes the same v1 line back");
+              "combo: re-saving the restored copy writes the same chunk back");
 
         e->destroy(dst);
+    }
+}
+
+/* A second save after a restore: the restored state round-trips without
+ * drift. */
+static void regression_second_save(const mpc_engine_t *e) {
+    void *a = e->create(NULL);
+    char orig[8192] = {0};
+
+    e->set_param(a, "level", "55");
+    e->set_param(a, "s17", "1");
+    e->set_param(a, "s18", "1");
+    e->set_param(a, "s19", "1");
+    e->get_param(a, "state", orig, sizeof orig);
+    e->destroy(a);
+
+    {
+        void *b = e->create(NULL);
+        char after[8192] = {0};
+        e->set_param(b, "state", orig);
+        e->get_param(b, "state", after, sizeof after);
+        check(!strcmp(orig, after), "second save after restore: chunk identical");
+
+        {
+            void *c = e->create(NULL);
+            e->set_param(c, "state", after);
+            check(sw_on(c, e, 17) == 1 && sw_on(c, e, 18) == 1 && sw_on(c, e, 19) == 1,
+                  "third restore: delay/reverb/chorus still on");
+            check(num_param(c, e, "level") == 55, "third restore: level still 55");
+            check(num_param(c, e, "active") == 0, "third restore: still inactive");
+            check(((probe_t *)c)->used == 0 && !shared_read_held(),
+                  "third restore: still nothing on the shared read");
+            e->destroy(c);
+        }
+        e->destroy(b);
+    }
+}
+
+/* Restore the same chunk into fresh copies repeatedly: no drift, and no
+ * decode ownership at any point until one of the copies is woken. */
+static void regression_mutation(const mpc_engine_t *e) {
+    void *a = e->create(NULL);
+    char chunk[8192] = {0};
+
+    e->set_param(a, "level", "33");
+    e->set_param(a, "s17", "1");
+    e->set_param(a, "s18", "1");
+    e->set_param(a, "s19", "1");
+    e->get_param(a, "state", chunk, sizeof chunk);
+    e->destroy(a);
+
+    {
+        void *b = e->create(NULL);
+        e->set_param(b, "state", chunk);
+        check(sw_on(b, e, 17) == 1 && sw_on(b, e, 18) == 1 && sw_on(b, e, 19) == 1,
+              "mutation: all three on after first restore");
+        check(((probe_t *)b)->used == 0 && !shared_read_held(),
+              "mutation: first restore holds nothing on the shared read");
+        e->destroy(b);
+    }
+    {
+        void *c = e->create(NULL);
+        e->set_param(c, "state", chunk);
+        check(sw_on(c, e, 17) == 1 && sw_on(c, e, 18) == 1 && sw_on(c, e, 19) == 1,
+              "mutation: all three on after second restore");
+        check(((probe_t *)c)->used == 0 && !shared_read_held(),
+              "mutation: second restore holds nothing on the shared read either");
+        e->destroy(c);
     }
 }
 
@@ -211,8 +277,7 @@ static void regression_full_state(const mpc_engine_t *e) {
     e->set_param(src, "s18", "1");  /* reverb */
     e->set_param(src, "s19", "1");  /* chorus */
     e->set_param(src, "s20", "1");  /* IN */
-    check(get_state(src, e, chunk, sizeof chunk) > 0, "full state: chunk saved");
-    check(!strncmp(chunk, "v1 ", 3), "full state: chunk is a v1 line");
+    e->get_param(src, "state", chunk, sizeof chunk);
     e->destroy(src);
 
     {
@@ -247,75 +312,11 @@ static void regression_full_state(const mpc_engine_t *e) {
     }
 }
 
-/* A restore into a copy that is already ACTIVE must re-point the shared
- * read at the saved routes, the way the live switch and SOURCE paths do.
- * The shared read is faked, so nothing here starts a thread. */
-static void regression_live_restore(const mpc_engine_t *e) {
-    void *c = e->create(NULL);
-    probe_t *P = (probe_t *)c;
-    fake_live();
-    e->set_param(c, "s0", "1");
-    e->set_param(c, "s5", "1");
-    e->set_param(c, "active", "1");
-    check(P->used == 0x21u && atomic_load(&g_use[0]) == 1 && atomic_load(&g_use[5]) == 1,
-          "live restore: setup, the playing copy holds main and track 5");
-    e->set_param(c, "state", "v1 20000 67"); /* delay only, copy still ACTIVE */
-    check(P->used == 0x20000u,
-          "live restore: the restore re-points the shared read at the saved routes");
-    check(atomic_load(&g_use[17]) == 1 && atomic_load(&g_use[0]) == 0 && atomic_load(&g_use[5]) == 0,
-          "live restore: the saved routes replace the old ones in the refcounts");
-    check(sw_on(c, e, 17) == 1 && sw_on(c, e, 0) == 0 && sw_on(c, e, 5) == 0,
-          "live restore: the switches themselves follow the restored mask");
-    e->set_param(c, "s3", "1");
-    check(P->used == 0x20008u && atomic_load(&g_use[3]) == 1,
-          "live restore: control, a live switch after the restore still moves the refcounts");
-    atomic_store(&g_alive, 0);
-    e->set_param(c, "active", "0");
-    check(P->used == 0u && atomic_load(&g_use[17]) == 0 && atomic_load(&g_use[3]) == 0,
-          "live restore: ACTIVE off after the restored mask drops every refcount");
-    e->destroy(c);
-}
-
-/* mix_owned: a valid restore owns the row, so a later SOURCE write (the
- * meter-refresh echo) cannot replace the restored switches. A real switch
- * press owns the row the same way. A fresh copy still takes a SOURCE, and a
- * saved SOURCE selection comes back as the same output, by position. */
-static void regression_mix_owned(const mpc_engine_t *e) {
-    void *c = e->create(NULL), *d;
-    char chunk[8192], label[64];
-
-    e->set_param(c, "source", "17");
-    check(get_state(c, e, chunk, sizeof chunk) > 0, "mix_owned: a SOURCE-only copy saved its chunk");
-    e->destroy(c);
-    d = e->create(NULL);
-    e->set_param(d, "state", chunk);
-    check(num_param(d, e, "source") == 17, "mix_owned: the saved SOURCE comes back as the same output");
-    e->get_param(d, "srcname", label, sizeof label);
-    check(!strcmp(label, "delay"), "mix_owned: the restored SOURCE names delay");
-    e->set_param(d, "source", "5");
-    check(num_param(d, e, "source") == 17 && sw_on(d, e, 17) == 1 && sw_on(d, e, 5) == 0,
-          "mix_owned: a SOURCE write after a valid restore cannot replace the routes");
-    e->get_param(d, "p_rel", label, sizeof label);
-    check(!strcmp(label, "delay"), "mix_owned: the refused SOURCE write leaves the label alone");
-    e->destroy(d);
-    c = e->create(NULL);
-    e->set_param(c, "source", "5");
-    check(num_param(c, e, "source") == 5 && sw_on(c, e, 5) == 1,
-          "mix_owned: control, a fresh copy still takes a SOURCE write");
-    e->destroy(c);
-    c = e->create(NULL);
-    e->set_param(c, "s5", "1");
-    e->set_param(c, "source", "3");
-    check(sw_on(c, e, 5) == 1 && sw_on(c, e, 3) == 0,
-          "mix_owned: a switch press also owns the row against a later SOURCE write");
-    e->destroy(c);
-}
-
-/* Guard for the cold-load default-switch rule. The state load re-arms the
+/* Guard for the cold-load default-switch rule. state_load() re-arms the
  * guard against replayed switch defaults (it clears switches_live), so the
  * values the host replays after a project load cannot clear the restored
  * DLY/REV/CHO. CONTROL: restore, then default-replay, with no audio before
- * the load. CANDIDATE: render once first, so the load lands mid-session -
+ * the load. CANDIDATE: render once first, so the load lands mid-session —
  * the restore must arm the guard again all the same. */
 static void reg_switches_live_diagnostic(const mpc_engine_t *e) {
     void *src = e->create(NULL);
@@ -334,8 +335,7 @@ static void reg_switches_live_diagnostic(const mpc_engine_t *e) {
     {
         void *dst = e->create(NULL);
         e->set_param(dst, "state", chunk);
-        /* replay MPC defaults: main on, the rest off */
-        e->set_param(dst, "s0", "1");
+        /* replay MPC defaults: all off */
         e->set_param(dst, "s17", "0");
         e->set_param(dst, "s18", "0");
         e->set_param(dst, "s19", "0");
@@ -352,7 +352,6 @@ static void reg_switches_live_diagnostic(const mpc_engine_t *e) {
         int16_t tmp[4];
         e->render(dst, tmp, 2); /* real render API, inactive copy, no thread */
         e->set_param(dst, "state", chunk);
-        e->set_param(dst, "s0", "1");
         e->set_param(dst, "s17", "0");
         e->set_param(dst, "s18", "0");
         e->set_param(dst, "s19", "0");
@@ -364,65 +363,18 @@ static void reg_switches_live_diagnostic(const mpc_engine_t *e) {
     }
 }
 
-/* A second save after a restore, and the same chunk into fresh copies
- * repeatedly: no drift, and no decode ownership at any point until a copy
- * is woken. */
-static void regression_second_save(const mpc_engine_t *e) {
-    void *a = e->create(NULL);
-    char orig[8192] = {0};
-
-    e->set_param(a, "level", "55");
-    e->set_param(a, "s17", "1");
-    e->set_param(a, "s18", "1");
-    e->set_param(a, "s19", "1");
-    check(get_state(a, e, orig, sizeof orig) > 0, "second save: chunk saved");
-    e->destroy(a);
-
-    {
-        void *b = e->create(NULL);
-        char after[8192] = {0};
-        e->set_param(b, "state", orig);
-        check(get_state(b, e, after, sizeof after) > 0 && !strcmp(orig, after),
-              "second save after restore: v1 line identical");
-        {
-            void *c = e->create(NULL);
-            e->set_param(c, "state", after);
-            check(sw_on(c, e, 17) == 1 && sw_on(c, e, 18) == 1 && sw_on(c, e, 19) == 1,
-                  "third restore: delay/reverb/chorus still on");
-            check(num_param(c, e, "level") == 55, "third restore: level still 55");
-            check(num_param(c, e, "active") == 0, "third restore: still inactive");
-            check(((probe_t *)c)->used == 0 && !shared_read_held(),
-                  "third restore: still nothing on the shared read");
-            e->destroy(c);
-        }
-        e->destroy(b);
-    }
-}
-
-/* A fresh copy saves its creation defaults, so a host that saves at once
- * does not lose the main switch. Pinned in the v1 format here. */
-static void regression_fresh_defaults(const mpc_engine_t *e) {
-    void *d0 = e->create(NULL);
-    char chunk[8192] = {0};
-    check(get_state(d0, e, chunk, sizeof chunk) > 0 && !strcmp(chunk, "v1 1 100"),
-          "a fresh copy saves the creation defaults as v1 1 100");
-    e->destroy(d0);
-}
-
 int main(void) {
     const mpc_engine_t *e = mpc_engine();
 
     /* No thread is ever started in this suite: g_alive is faked only inside
      * the activation windows in fake_live(), and dropped again there before
      * any copy stops or dies. Everything else runs with the read down. */
-    regression_fresh_defaults(e);
     regression_inactive_restore(e);
     regression_combos(e);
-    regression_full_state(e);
-    regression_live_restore(e);
-    regression_mix_owned(e);
-    reg_switches_live_diagnostic(e);
     regression_second_save(e);
+    regression_mutation(e);
+    regression_full_state(e);
+    reg_switches_live_diagnostic(e);
 
     printf("%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;

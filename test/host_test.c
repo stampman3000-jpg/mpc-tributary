@@ -561,6 +561,7 @@ int main(void) {
         e->set_param(saved, "s5", "1");
         e->set_param(saved, "level", "40");
         check(e->get_param(saved, "state", buf, sizeof buf) > 0, "the project can store the switches");
+        check(!strncmp(buf, "T1 ", 3), "the saved chunk is a T1 line");
         loaded = e->create(NULL);
         e->set_param(loaded, "state", buf);
         e->set_param(loaded, "source", "0");
@@ -574,6 +575,81 @@ int main(void) {
               "a reloaded project keeps the switches and the level");
         e->destroy(saved);
         e->destroy(loaded);
+    }
+
+    {
+        /* A T1 chunk carries level, active, and the mix, and an ACTIVE restore
+         * comes back through the live path: the shared read re-points like a
+         * switch press, and a SOURCE write after it cannot replace the routes. */
+        void *woken;
+        atomic_store(&g_exited, 0);
+        atomic_store(&g_alive, 1);
+        woken = e->create(NULL);
+        e->set_param(woken, "state", "T1 60 1 20");
+        check(atomic_load(&g_use[5]) == 1 && atomic_load(&g_use[0]) == 0,
+              "an ACTIVE T1 restore decodes exactly the saved output");
+        e->get_param(woken, "s5", r[0], 64);
+        e->get_param(woken, "level", r[1], 64);
+        check(!strcmp(r[0], "1") && !strcmp(r[1], "60"),
+              "a T1 restore brings back the level, the active flag, and the mix");
+        e->set_param(woken, "source", "0");
+        e->get_param(woken, "s5", r[0], 64);
+        check(!strcmp(r[0], "1"), "a SOURCE write after a T1 restore cannot replace the routes");
+        e->destroy(woken);
+        check(atomic_load(&g_use[5]) == 0, "the decode goes back when the copy goes away");
+        atomic_store(&g_alive, 0);
+    }
+    {
+        /* A project loaded after audio has run must still refuse the switch
+         * defaults the host replays after a load. */
+        void *mid = e->create(NULL);
+        int16_t quiet[16];
+        memset(quiet, 0, sizeof quiet);
+        e->render(mid, quiet, 8);
+        e->set_param(mid, "s0", "0");
+        e->set_param(mid, "state", "T1 40 0 22");
+        e->set_param(mid, "s1", "0");
+        e->set_param(mid, "s5", "0");
+        e->set_param(mid, "source", "9");
+        e->get_param(mid, "s1", r[0], 64);
+        e->get_param(mid, "s5", r[1], 64);
+        check(!strcmp(r[0], "1") && !strcmp(r[1], "1"),
+              "a load mid-session re-arms the guard against replayed switch defaults");
+        e->destroy(mid);
+    }
+    {
+        /* 1.2.5 saved "v1 <mix> <level>" with no active flag. Old projects
+         * still load, and they never wake the copy. */
+        void *old = e->create(NULL);
+        int i, owned = 0;
+        e->set_param(old, "state", "v1 22 40");
+        e->get_param(old, "s1", r[0], 64);
+        e->get_param(old, "s5", r[1], 64);
+        e->get_param(old, "level", r[2], 64);
+        check(!strcmp(r[0], "1") && !strcmp(r[1], "1") && !strcmp(r[2], "40"),
+              "a 1.2.5 v1 chunk still restores its level and routes");
+        e->set_param(old, "source", "0");
+        e->get_param(old, "s5", r[0], 64);
+        check(!strcmp(r[0], "1"), "a SOURCE write after a v1 restore keeps the routes too");
+        for (i = 0; i < TB_MAX; i++) if (atomic_load(&g_use[i])) owned = 1;
+        check(!owned, "an inactive restore takes no decode ownership");
+        e->destroy(old);
+    }
+    {
+        /* A chunk that does not parse exactly is refused whole: the copy
+         * keeps what it had. */
+        void *stub = e->create(NULL);
+        e->set_param(stub, "state", "T1 30 0 4");
+        e->set_param(stub, "state", "T1 90 0 4 junk");
+        e->set_param(stub, "state", "T1 90 0");
+        e->set_param(stub, "state", "T2 90 0 4");
+        e->set_param(stub, "state", "T1  90 0 4");
+        e->set_param(stub, "state", "T1 190 0 4");
+        e->get_param(stub, "level", r[0], 64);
+        e->get_param(stub, "s2", r[1], 64);
+        check(!strcmp(r[0], "30") && !strcmp(r[1], "1"),
+              "a damaged T1 chunk is refused whole");
+        e->destroy(stub);
     }
 
     e->destroy(inst);
