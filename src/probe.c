@@ -1761,6 +1761,145 @@ static void destroy(void *inst) {
 
 static void midi(void *inst, const uint8_t *msg, int len) { (void)inst; (void)msg; (void)len; }
 
+/* ---- project state: the chunk the VST2 wrapper saves per copy ----
+ *
+ * The wrapper's effGetChunk asks the engine for the key "state" and saves the
+ * text with the project; effSetChunk hands the same text back on a project
+ * load. The chunk is one short line, version-tagged, with no NUL in it:
+ *
+ *   T1 <level> <active> <mix>
+ *
+ *   level   0-100, this copy's track level.
+ *   active  0 or 1, whether this copy is playing.
+ *   mix     hex, one bit per output position on the connected machine's
+ *           map, in src/devices.h order (bit 0 = main, bit 17 = delay,
+ *           bit 20 = in). The chunk does not name the machine, so a saved
+ *           output comes back as the same position: the same output only
+ *           while the same machine model is connected. Bits at or past
+ *           TB_MAX are dropped, never moved onto another output; bits
+ *           below TB_MAX but past the connected map are kept and saved
+ *           again.
+ *
+ * Anything that does not parse exactly - wrong version, a missing or extra
+ * separator, an unreadable or out-of-range field, junk at the end - is
+ * refused whole, and the copy keeps what it had. A fresh copy keeps its
+ * creation defaults. Projects saved by 1.2.5 carry the older line
+ * "v1 <mix> <level>", which is still read in: it names no active flag, so
+ * restoring one never starts or stops the copy. */
+
+/* One unsigned number, right here: digits only in the given base, no sign,
+ * no leading zero on a multi-digit number, at most eight digits, at most
+ * max. Separators are the caller's job, so a missing or doubled space
+ * around a field is a refusal, not a skip. */
+static int state_num(const char **p, unsigned long *out, int base, unsigned long max) {
+    const char *s = *p;
+    int digits = 0;
+    unsigned long v;
+    char *end;
+    if (*s == '-' || *s == '+') return 0;
+    for (;;) {
+        char c = s[digits];
+        int ok = c >= '0' && c <= '9';
+        if (!ok && base == 16) ok = (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!ok) break;
+        digits++;
+    }
+    if (digits < 1 || digits > 8) return 0;
+    if (digits > 1 && s[0] == '0') return 0;
+    v = strtoul(s, &end, base);
+    if (end != s + digits || v > max) return 0;
+    *out = v;
+    *p = end;
+    return 1;
+}
+
+/* A field after the version: exactly one space, then the number. */
+static int state_field(const char **p, unsigned long *out, int base, unsigned long max) {
+    if (**p != ' ') return 0;
+    (*p)++;
+    return state_num(p, out, base, max);
+}
+
+/* Write the state line. A length of 0 tells the wrapper "no chunk", which is
+ * also the answer when the caller's buffer cannot hold the whole line. */
+static int state_save(probe_t *P, char *buf, int buf_len) {
+    char line[32];
+    int n;
+    if (!P || !buf || buf_len < 2) return 0;
+    n = snprintf(line, sizeof line, "T1 %d %u %x",
+                 atomic_load_explicit(&P->level, memory_order_relaxed),
+                 P->active ? 1u : 0u,
+                 (unsigned)atomic_load_explicit(&P->mix, memory_order_relaxed));
+    if (n < 0 || n >= buf_len) return 0;
+    memcpy(buf, line, (size_t)n + 1);
+    return n;
+}
+
+/* The 1.2.5 line, "v1 <mix> <level>", read in so old projects still come back.
+ * No active flag on it, so this only fills the level and the routes and never
+ * touches the copy's active state: the shared read follows only if the copy
+ * was already playing. */
+static int state_load_legacy(probe_t *P, const char *val) {
+    unsigned long mix, level;
+    const char *p = val;
+    uint32_t m;
+    if (p[0] != 'v' || p[1] != '1') return 0;
+    p += 2;
+    if (!state_field(&p, &mix, 16, 0xFFFFFFFFul)) return 0;
+    if (!state_field(&p, &level, 10, 100)) return 0;
+    if (*p != '\0') return 0;
+    m = (uint32_t)mix;
+    if (TB_MAX < 32) m &= (1u << TB_MAX) - 1u;
+    atomic_store_explicit(&P->mix, m, memory_order_relaxed);
+    atomic_store_explicit(&P->level, (int)level, memory_order_relaxed);
+    P->saw_source = 1;
+    P->mix_owned = 1;
+    P->switches_live = 0;
+    pthread_mutex_lock(&P->lock);
+    mix_label(m, P->rel, TXT);
+    pthread_mutex_unlock(&P->lock);
+    if (P->active) use_apply(P);
+    return 1;
+}
+
+/* Restore the whole state from a saved chunk. A valid restore makes the copy
+ * the owner of its row, so a later SOURCE write cannot replace the switches,
+ * and it re-arms the switch-default guard for the values the host replays
+ * after a project load. The routes go back through the live paths only: an
+ * ACTIVE restore starts or joins the shared read, a restore into a playing
+ * copy re-points it like a switch press, and an inactive copy asks for
+ * nothing. */
+static int state_load(probe_t *P, const char *val) {
+    unsigned long version, level, active, mix;
+    const char *p = val;
+    uint32_t m;
+    if (!P || !val) return 0;
+    if (*p != 'T') return state_load_legacy(P, val);
+    p++;
+    if (!state_num(&p, &version, 10, 99)) return 0; /* the version sits hard against the T */
+    if (version != 1) return 0; /* a line from a later version is refused whole */
+    if (!state_field(&p, &level, 10, 100)) return 0;
+    if (!state_field(&p, &active, 10, 1)) return 0;
+    if (!state_field(&p, &mix, 16, 0xFFFFFFFFul)) return 0;
+    if (*p != '\0') return 0;
+    atomic_store_explicit(&P->level, (int)level, memory_order_relaxed);
+    m = (uint32_t)mix;
+    if (TB_MAX < 32) m &= (1u << TB_MAX) - 1u;
+    atomic_store_explicit(&P->mix, m, memory_order_relaxed);
+    /* The saved routes are the truth, so a later default switch must not add
+     * main on top of them and a later SOURCE write must not replace them. */
+    P->saw_source = 1;
+    P->mix_owned = 1;
+    pthread_mutex_lock(&P->lock);
+    mix_label(m, P->rel, TXT);
+    pthread_mutex_unlock(&P->lock);
+    if (active && !P->active) hear_on(P);
+    else if (!active && P->active) hear_off(P);
+    else if (active && P->active) use_apply(P); /* live restore: re-point the shared read like a switch press */
+    P->switches_live = 0;
+    return 1;
+}
+
 static int switch_index(const char *key);
 
 static void set_param(void *inst, const char *key, const char *val) {
@@ -1814,25 +1953,7 @@ static void set_param(void *inst, const char *key, const char *val) {
         pthread_mutex_unlock(&P->lock);
         if (P->active) use_apply(P);
     } else if (!strcmp(key, "state")) {
-        unsigned mix = 0;
-        int level = 100, lim;
-        if (sscanf(val, "v1 %x %d", &mix, &level) != 2) return;
-        lim = src_lim();
-        if (lim < 32) mix &= (1u << lim) - 1u;
-        if (level < 0) level = 0;
-        if (level > 100) level = 100;
-        atomic_store_explicit(&P->mix, mix, memory_order_relaxed);
-        atomic_store_explicit(&P->level, level, memory_order_relaxed);
-        P->mix_owned = 1;
-        P->saw_source = 1;
-        /* A project load re-arms the switch-default guard: what the host replays
-         * after the load are defaults again, not player moves. A load that lands
-         * after audio has run would otherwise let them clear the saved routes. */
-        P->switches_live = 0;
-        pthread_mutex_lock(&P->lock);
-        mix_label(mix, P->rel, TXT);
-        pthread_mutex_unlock(&P->lock);
-        if (P->active) use_apply(P);
+        state_load(P, val);
     } else {
         int sw = switch_index(key);
         if (sw >= 0) {
@@ -1919,10 +2040,7 @@ static int get_param(void *inst, const char *key, char *buf, int buf_len) {
     } else if (!strcmp(key, "level")) {
         return snprintf(buf, buf_len, "%d", atomic_load_explicit(&P->level, memory_order_relaxed));
     } else if (!strcmp(key, "state")) {
-        uint32_t m = atomic_load_explicit(&P->mix, memory_order_relaxed);
-        int lim = src_lim();
-        if (lim < 32) m &= (1u << lim) - 1u;
-        return snprintf(buf, buf_len, "v1 %x %d", m, atomic_load_explicit(&P->level, memory_order_relaxed));
+        return state_save(P, buf, buf_len);
     } else if (!strcmp(key, "meter")) {
         int m = atomic_load_explicit(&P->meter, memory_order_relaxed);
         if (m < 0) m = 0;
