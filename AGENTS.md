@@ -1,3 +1,5 @@
+Global rules: also follow ~/agents/AGENTS.md (Johnny's shared rules for all agents).
+
 # Agents
 
 For the next agent. Stampman3000 is a hobby builder. Explain in plain language, and keep a change small enough that he can hear it on the MPC. The README is the page for people. This file is the map and the rules. This repository is public.
